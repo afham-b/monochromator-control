@@ -80,6 +80,6 @@ def main():
     
     logfile.close()
 
-if __name__ == "__main__":
+sif __name__ == "__main__":
     main()
         
