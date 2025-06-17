@@ -16,7 +16,7 @@ pins = [IN1, IN2, IN3, IN4]
 for pin in pins:
     board.digital[pin].mode = 1  # OUTPUT
 
-seq_og = [
+seq1 = [
     [1,0,0,1],
     [1,0,0,0],
     [1,1,0,0],
@@ -27,15 +27,35 @@ seq_og = [
     [0,0,0,1]
 ]
 
-seq = [
+seq2 = [
+    [1,0,0,0],
+    [0,1,0,0],
+    [0,0,1,0],
+    [0,0,0,1],
+    [1,0,0,0],
+    [0,1,0,0],
+    [0,0,1,0],
+    [0,0,0,1],
     [1,0,0,0],
     [0,1,0,0],
     [0,0,1,0],
     [0,0,0,1]
 ]
 
+seq3 = [
+    [1,0,0,0],   # Step 1
+    [1,1,0,0],   # Step 2
+    [0,1,0,0],   # Step 3
+    [0,1,1,0],   # Step 4
+    [0,0,1,0],   # Step 5
+    [0,0,1,1],   # Step 6
+    [0,0,0,1],   # Step 7
+    [1,0,0,1]    # Step 8
+]
+
+
 for i in range(512):
-    for step in seq:
+    for step in seq1:
         for p, v in zip(pins, step):
             board.digital[p].write(v)
         time.sleep(0.001)
