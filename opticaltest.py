@@ -19,9 +19,9 @@ try:
         if value is None:
             print("Waiting for pin state...")
         elif value == 0:
-            print("SWITCH BLOCKED (beam blocked by metal disk)")
-        else:
             print("SWITCH OPEN (slit present in sensor)")
+        else:
+            print("SWITCH BLOCKED (beam blocked by metal disk)")
         time.sleep(0.1)
 except KeyboardInterrupt:
     print("\nExiting.")
