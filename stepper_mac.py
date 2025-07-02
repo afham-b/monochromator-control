@@ -3,8 +3,16 @@
 from pyfirmata import Arduino
 import time
 import keyboard
+import sys
+import termios
+from pynput import keyboard
 
-board = Arduino('COM10')  # Set your Arduino port here
+
+#windows
+#board = Arduino('COM10')  # Set your Arduino port here
+
+#mac, open terminal and type this for com number ls /dev/tty.*
+board = Arduino('/dev/cu.usbmodem1101')
 
 pins = [11, 10, 9, 8]  # IN1–IN4 pins on ULN2003
 
@@ -23,7 +31,7 @@ seq = [
 step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
 
-def move_stepper(sequence, steps, step_delay):
+def move_stepper(sequence, steps,step_delay):
     for _ in range(steps):
         for step in sequence:
             for pin, val in zip(pins, step):
@@ -83,6 +91,59 @@ def jog_mode(step_delay):
         for pin in pins:
             board.digital[pin].write(0)
 
+def step_forward(step_delay):
+    for step in seq:
+        for pin, val in zip(pins, step):
+            board.digital[pin].write(val)
+        time.sleep(step_delay)
+
+def step_reverse(step_delay):
+    for step in reversed(seq):
+        for pin, val in zip(pins, step):
+            board.digital[pin].write(val)
+        time.sleep(step_delay)
+
+def flush_input():
+    termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+def jog_mode2(step_delay):
+    print("\n--- Jog Mode ---")
+    print("Hold UP for forward, DOWN for reverse. Press Q to quit jog mode.")
+
+    running = True
+    forward_pressed = False
+    reverse_pressed = False
+
+    def on_press(key):
+        nonlocal running, forward_pressed, reverse_pressed
+        if key == keyboard.Key.up:
+            forward_pressed = True
+        elif key == keyboard.Key.down:
+            reverse_pressed = True
+        elif hasattr(key, 'char') and key.char and key.char.lower() == 'q':
+            running = False
+            print("Exiting jog mode.")
+            return False
+
+    def on_release(key):
+        nonlocal forward_pressed, reverse_pressed
+        if key == keyboard.Key.up:
+            forward_pressed = False
+        elif key == keyboard.Key.down:
+            reverse_pressed = False
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+
+    while running:
+        if forward_pressed:
+            step_forward(step_delay)
+        if reverse_pressed:
+            step_reverse(step_delay)
+        time.sleep(0.01)  # Adjust for responsiveness/smoothness
+
+    listener.stop()
+
 def main():
     global step_delay
     print("Stepper Motor Control")
@@ -96,18 +157,26 @@ def main():
         if cmd == 'F' or cmd == 'f':
             print(f"Moving forward at {int(step_delay * 1000)} ms/step...")
             move_stepper(seq, steps_per_move, step_delay)
+            flush_input()
         elif cmd == 'R' or cmd == 'r':
             print(f"Moving reverse at {int(step_delay * 1000)} ms/step...")
             move_stepper(list(reversed(seq)), steps_per_move, step_delay)
+            flush_input()
         elif cmd == 'J' or cmd == 'j':
-            jog_mode(step_delay)
+            #jog_mode(step_delay)
+            # for mac, jog2 function uses pynput instead of keyboard package
+            jog_mode2(step_delay)
+            flush_input()
         elif cmd == 'S' or cmd == 's':
             step_delay = set_speed(step_delay)
+            flush_input()
         elif cmd == 'Q' or cmd == 'q':
             print("Quitting.")
+            flush_input()
             break
         else:
             print("Invalid option. Enter F, R, J, S, or Q.")
+            flush_input()
     for pin in pins:
         board.digital[pin].write(0)
     board.exit()
