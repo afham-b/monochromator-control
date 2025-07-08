@@ -1,6 +1,6 @@
 #pip install pyfirmata keyboard
 
-from pyfirmata import Arduino
+from pyfirmata import Arduino, util 
 import time
 import keyboard
 import sys
@@ -15,6 +15,27 @@ from pynput import keyboard
 board = Arduino('/dev/cu.usbmodem1101')
 
 pins = [11, 10, 9, 8]  # IN1–IN4 pins on ULN2003
+
+#first optical switch 
+optical_pin = 7
+#second optical switch
+optical_pin2 = 5
+
+# Start the iterator to receive input from the board
+it = util.Iterator(board)
+it.start()
+
+# Set up pin 7 as input
+board.digital[optical_pin].mode = 0  # 0 means INPUT
+#Set up pin 5 as second input
+board.digital[optical_pin2].mode = 0 
+
+#switch 1 is for the smaller disk
+switch1 = board.digital[optical_pin].read()
+#switch 2 is for the larger worm gear 
+switch2 = board.digital[optical_pin2].read()
+#use to initialize an array to track the switch states 
+last_states = ["", ""]
 
 # Define your step sequence (half-step example)
 seq = [
@@ -36,6 +57,7 @@ def move_stepper(sequence, steps,step_delay):
         for step in sequence:
             for pin, val in zip(pins, step):
                 board.digital[pin].write(val)
+            monitor_sensors()
             time.sleep(step_delay)
     # Turn all pins off when done
     for pin in pins:
@@ -73,12 +95,14 @@ def jog_mode(step_delay):
                 for step in seq:
                     for pin, val in zip(pins, step):
                         board.digital[pin].write(val)
+                    monitor_sensors
                     time.sleep(step_delay)
             elif keyboard.is_pressed('down'):
                 # Move one step in reverse
                 for step in reversed(seq):
                     for pin, val in zip(pins, step):
                         board.digital[pin].write(val)
+                    monitor_sensors
                     time.sleep(step_delay)
             else:
                 # Release all pins to stop holding torque
@@ -95,12 +119,14 @@ def step_forward(step_delay):
     for step in seq:
         for pin, val in zip(pins, step):
             board.digital[pin].write(val)
+            monitor_sensors()
         time.sleep(step_delay)
 
 def step_reverse(step_delay):
     for step in reversed(seq):
         for pin, val in zip(pins, step):
             board.digital[pin].write(val)
+            monitor_sensors()
         time.sleep(step_delay)
 
 def flush_input():
@@ -140,9 +166,34 @@ def jog_mode2(step_delay):
             step_forward(step_delay)
         if reverse_pressed:
             step_reverse(step_delay)
+        monitor_sensors()
         time.sleep(0.01)  # Adjust for responsiveness/smoothness
 
     listener.stop()
+
+def monitor_sensors():
+    
+    switch1 = board.digital[optical_pin].read()
+    switch2 = board.digital[optical_pin2].read()
+
+    state1 = (
+        "Waiting" if switch1 is None else
+        "BLOCKED" if switch1 else
+        "OPEN"
+    )
+    state2 = (
+        "Waiting" if switch2 is None else
+        "BLOCKED" if switch2 else
+        "OPEN"
+    )
+ 
+    print(f"Sensor 1: {state1} | Sensor 2: {state2}")
+
+    #only print if a state has changed 
+    # if (state1, state2) != tuple(last_states):
+    #     print(f"Sensor 1: {state1} | Sensor 2: {state2}")
+    #     last_states[0], last_states[1] = state1, state2  # update in-place
+
 
 def main():
     global step_delay

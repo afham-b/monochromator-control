@@ -22,7 +22,7 @@ board.digital[optical_pin].mode = 0  # 0 means INPUT
 #Set up pin 5 as second input
 board.digital[optical_pin2].mode = 0 
 
-print("Reading optical switch on D7. Press Ctrl+C to exit.")
+print("Reading optical switch on D7 & D5. Press Ctrl+C to exit.")
 try:
     while True:
         # code for single optical switch
