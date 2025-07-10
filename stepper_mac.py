@@ -37,6 +37,9 @@ switch2 = board.digital[optical_pin2].read()
 #use to initialize an array to track the switch states 
 last_states = ["", ""]
 
+# used to monitor 
+global step_count
+
 # Define your step sequence (half-step example)
 seq = [
     [1,0,0,1],
@@ -202,9 +205,11 @@ def main():
     print("R: Reverse")
     print("J: Jog Mode (UP/DOWN arrows)")
     print("S: Speed Settings")
+    print("H: Return to Home")
     print("Q: Quit")
+
     while True:
-        cmd = input("Enter option Forward, Reverse, Jog, Speed Settings, Quit (F/R/J/S/Q): ").strip().upper()
+        cmd = input("Enter option Forward, Reverse, Jog, Speed Settings, Home, Quit (F/R/J/S/H/Q): ").strip().upper()
         if cmd == 'F' or cmd == 'f':
             print(f"Moving forward at {int(step_delay * 1000)} ms/step...")
             move_stepper(seq, steps_per_move, step_delay)
@@ -221,12 +226,15 @@ def main():
         elif cmd == 'S' or cmd == 's':
             step_delay = set_speed(step_delay)
             flush_input()
+        elif cmd == 'H' or cmd == 'h': 
+            print("Homing, please stand by")
+            #go_home(step_delay)
         elif cmd == 'Q' or cmd == 'q':
             print("Quitting.")
             flush_input()
             break
         else:
-            print("Invalid option. Enter F, R, J, S, or Q.")
+            print("Invalid option. Enter F, R, J, S, H, or Q.")
             flush_input()
     for pin in pins:
         board.digital[pin].write(0)
