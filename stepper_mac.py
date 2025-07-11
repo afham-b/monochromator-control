@@ -37,8 +37,18 @@ switch2 = board.digital[optical_pin2].read()
 #use to initialize an array to track the switch states 
 last_states = ["", ""]
 
-# used to monitor 
-global step_count
+# used to monitor steps and revolutions of the small disk in revs
+step_count = 0 
+rev_count = 0 
+#boolean to track home
+home = False
+last_switch1_state = None
+last_switch2_state = None
+transition_sequence = []
+
+# determined by calibration
+steps_per_rev = 0
+revs_per_rotation = 0 
 
 # Define your step sequence (half-step example)
 seq = [
@@ -49,22 +59,63 @@ seq = [
     [0,1,1,0],
     [0,0,1,0],
     [0,0,1,1],
-    [0,0,0,1]
+    [0,0,0,1],
+    [1,0,0,1]
 ]
 
 step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
 
-def move_stepper(sequence, steps,step_delay):
+def move_stepper(seq, steps,step_delay, direction):
+    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home
+    # do NOT reinitialize them here!
+    # just update their values as you go
+
+    if direction == -1:
+        sequence = list(reversed(seq))
+    else: sequence = seq
+
     for _ in range(steps):
         for step in sequence:
             for pin, val in zip(pins, step):
                 board.digital[pin].write(val)
             monitor_sensors()
+
+             # Read switch 1 (smaller disk) state each time you move a step
+            switch1 = board.digital[optical_pin].read()
+            if switch1 is None:
+                state1 = "WAITING"
+            elif switch1:
+                state1 = "BLOCKED"
+            else:
+                state1 = "OPEN"
+
+            # Track transition sequence for open->blocked->open
+            if last_switch1_state is not None:
+                # Only add when state changes
+                if state1 != last_switch1_state:
+                    transition_sequence.append(state1)
+                    # Keep last three states only
+                    if len(transition_sequence) > 3:
+                        transition_sequence.pop(0)
+
+                    # Check for open->blocked->open
+                    if transition_sequence == ["OPEN", "BLOCKED", "OPEN"]:
+                        rev_count += 1*direction
+                        #print(f"Full revolution detected! Total revolutions: {rev_count}")
+                        transition_sequence = ["OPEN"]  # reset for next revolution
+
+            last_switch1_state = state1
             time.sleep(step_delay)
+
+        step_count += 1*direction  # After one complete seq, count as one step
     # Turn all pins off when done
     for pin in pins:
         board.digital[pin].write(0)
+
+    #for testing    
+    print("step count", step_count)
+    print("rev count", rev_count)
 
 def set_speed(current_delay):
     print(f"Current speed: {int(current_delay*1000)} ms per step")
@@ -86,8 +137,10 @@ def set_speed(current_delay):
             print("Invalid input. Enter a number.")
 
 def jog_mode(step_delay):
+    global step_count, rev_count, home
+
     print("\n--- Jog Mode ---")
-    print("Hold UP for forward, DOWN for reverse. Press Q to quit jog mode.")
+    print("Hold UP for forward CCW, DOWN for reverse CW. Press Q to quit jog mode.")
     try:
         while True:
             if keyboard.is_pressed('q'):
@@ -95,23 +148,34 @@ def jog_mode(step_delay):
                 break
             elif keyboard.is_pressed('up'):
                 # Move one step forward
-                for step in seq:
-                    for pin, val in zip(pins, step):
-                        board.digital[pin].write(val)
-                    monitor_sensors
-                    time.sleep(step_delay)
+                # for step in seq:
+                #     for pin, val in zip(pins, step):
+                #         board.digital[pin].write(val)
+                #     monitor_sensors
+                #     time.sleep(step_delay)
+                move_stepper(seq, steps_per_move =1, step_delay =0.001, direction= 1)
+                 #for testing    
+                print("step count", step_count)
+                print("rev count", rev_count)
+
+
             elif keyboard.is_pressed('down'):
                 # Move one step in reverse
-                for step in reversed(seq):
-                    for pin, val in zip(pins, step):
-                        board.digital[pin].write(val)
-                    monitor_sensors
-                    time.sleep(step_delay)
+                # for step in reversed(seq):
+                #     for pin, val in zip(pins, step):
+                #         board.digital[pin].write(val)
+                #     monitor_sensors
+                #     time.sleep(step_delay)
+                move_stepper(seq, steps_per_move =1, step_delay =0.001, direction= -1)
+                 #for testing    
+                print("step count", step_count)
+                print("rev count", rev_count)
             else:
                 # Release all pins to stop holding torque
                 for pin in pins:
                     board.digital[pin].write(0)
                 time.sleep(0.01)
+
     except KeyboardInterrupt:
         pass
     finally:
@@ -151,7 +215,9 @@ def jog_mode2(step_delay):
             reverse_pressed = True
         elif hasattr(key, 'char') and key.char and key.char.lower() == 'q':
             running = False
-            print("Exiting jog mode.")
+            print("Exiting jog mode.")   
+            print("step count", step_count)
+            print("rev count", rev_count)
             return False
 
     def on_release(key):
@@ -166,15 +232,22 @@ def jog_mode2(step_delay):
 
     while running:
         if forward_pressed:
-            step_forward(step_delay)
+            move_stepper(seq, steps =1, step_delay =0.001, direction= 1)
+            #for testing    
+            print("step count", step_count)
+            print("rev count", rev_count)
         if reverse_pressed:
-            step_reverse(step_delay)
+            move_stepper(seq, steps=1, step_delay =0.001, direction= -1)
+            #for testing    
+            print("step count", step_count)
+            print("rev count", rev_count)
         monitor_sensors()
         time.sleep(0.01)  # Adjust for responsiveness/smoothness
 
     listener.stop()
 
 def monitor_sensors():
+    global step_count, rev_count
     
     switch1 = board.digital[optical_pin].read()
     switch2 = board.digital[optical_pin2].read()
@@ -192,6 +265,12 @@ def monitor_sensors():
  
     print(f"Sensor 1: {state1} | Sensor 2: {state2}")
 
+    if state2 == "OPEN":
+        print("Home position detected! Step count reset to 0.")
+        step_count = 0
+        rev_count = 0
+        home = True
+
     #only print if a state has changed 
     # if (state1, state2) != tuple(last_states):
     #     print(f"Sensor 1: {state1} | Sensor 2: {state2}")
@@ -201,8 +280,8 @@ def monitor_sensors():
 def main():
     global step_delay
     print("Stepper Motor Control")
-    print("F: Forward")
-    print("R: Reverse")
+    print("F: Forward CCW")
+    print("R: Reverse CW")
     print("J: Jog Mode (UP/DOWN arrows)")
     print("S: Speed Settings")
     print("H: Return to Home")
@@ -212,11 +291,11 @@ def main():
         cmd = input("Enter option Forward, Reverse, Jog, Speed Settings, Home, Quit (F/R/J/S/H/Q): ").strip().upper()
         if cmd == 'F' or cmd == 'f':
             print(f"Moving forward at {int(step_delay * 1000)} ms/step...")
-            move_stepper(seq, steps_per_move, step_delay)
+            move_stepper(seq, steps_per_move, step_delay, direction= 1)
             flush_input()
         elif cmd == 'R' or cmd == 'r':
             print(f"Moving reverse at {int(step_delay * 1000)} ms/step...")
-            move_stepper(list(reversed(seq)), steps_per_move, step_delay)
+            move_stepper(seq, steps_per_move, step_delay, direction= -1)
             flush_input()
         elif cmd == 'J' or cmd == 'j':
             #jog_mode(step_delay)
