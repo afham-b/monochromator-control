@@ -49,6 +49,7 @@ transition_sequence = []
 # determined by calibration
 steps_per_rev = 0
 revs_per_rotation = 0 
+delta_steps = 0 
 
 # Define your step sequence (half-step example)
 seq = [
@@ -67,7 +68,7 @@ step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
 
 def move_stepper(seq, steps,step_delay, direction):
-    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home
+    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, switch1, switch2
     # do NOT reinitialize them here!
     # just update their values as you go
 
@@ -147,26 +148,14 @@ def jog_mode(step_delay):
                 print("Exiting jog mode.\n")
                 break
             elif keyboard.is_pressed('up'):
-                # Move one step forward
-                # for step in seq:
-                #     for pin, val in zip(pins, step):
-                #         board.digital[pin].write(val)
-                #     monitor_sensors
-                #     time.sleep(step_delay)
-                move_stepper(seq, steps_per_move =1, step_delay =0.001, direction= 1)
+                move_stepper(seq, steps=1, step_delay =0.001, direction= 1)
                  #for testing    
                 print("step count", step_count)
                 print("rev count", rev_count)
 
-
             elif keyboard.is_pressed('down'):
                 # Move one step in reverse
-                # for step in reversed(seq):
-                #     for pin, val in zip(pins, step):
-                #         board.digital[pin].write(val)
-                #     monitor_sensors
-                #     time.sleep(step_delay)
-                move_stepper(seq, steps_per_move =1, step_delay =0.001, direction= -1)
+                move_stepper(seq, steps =1, step_delay =0.001, direction= -1)
                  #for testing    
                 print("step count", step_count)
                 print("rev count", rev_count)
@@ -182,22 +171,62 @@ def jog_mode(step_delay):
         for pin in pins:
             board.digital[pin].write(0)
 
-def step_forward(step_delay):
-    for step in seq:
-        for pin, val in zip(pins, step):
-            board.digital[pin].write(val)
-            monitor_sensors()
-        time.sleep(step_delay)
-
-def step_reverse(step_delay):
-    for step in reversed(seq):
-        for pin, val in zip(pins, step):
-            board.digital[pin].write(val)
-            monitor_sensors()
-        time.sleep(step_delay)
-
 def flush_input():
     termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+def calibration():
+    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, steps_per_rev, revs_per_rotation
+    print("\n--- Calibration ---")
+
+     # --- Steps per rev FORWARD ---
+    print("Calibrating steps per revolution (FORWARD)...")
+    step_count = 0
+    rev_count = 0
+    transition_sequence = ["OPEN"]
+    last_switch1_state = "OPEN"
+
+    #lets reset the small disk to its open if needed and reset steps
+    while True:
+        monitor_sensors()
+        if switch1: 
+          move_stepper(seq, 1, step_delay=0.015, direction=1)
+        # Check for one full revolution:
+        if switch1 == 0 or False: 
+            step_count =0
+            print( "Switch 1 open, small disk slit open")
+            break
+
+    time.sleep(3)
+    
+    # lets move the small disk into the block, but COUNT those steps as part of steps/rev
+    while True:
+        monitor_sensors()
+        if switch1 == False: 
+          move_stepper(seq, 1, step_delay=0.015, direction=1)
+        # Check for one full revolution:
+        if switch1: 
+            print( "Switch 1 blocked, small disk slit closed")
+            break
+
+    time.sleep(0.05)
+
+    #lets take it back to home
+    while True:
+        monitor_sensors()
+        if switch1: 
+          move_stepper(seq, 1, step_delay=0.015, direction=1)
+        # Check for one full revolution:
+        if switch1 == 0 or False: 
+            print( "Switch 1 open, small disk slit open")
+            break
+
+    steps_per_rev = step_count
+    print("Steps per rev are ",steps_per_rev)
+
+    #print("\n--- Starting Calibration ---")
+    #print("Now Taking bets on how many revs+steps it takes to make it home brrrrrrrrrrrr")
+
+
 
 def jog_mode2(step_delay):
     print("\n--- Jog Mode ---")
@@ -247,7 +276,7 @@ def jog_mode2(step_delay):
     listener.stop()
 
 def monitor_sensors():
-    global step_count, rev_count
+    global step_count, rev_count, switch1, switch2
     
     switch1 = board.digital[optical_pin].read()
     switch2 = board.digital[optical_pin2].read()
@@ -285,10 +314,11 @@ def main():
     print("J: Jog Mode (UP/DOWN arrows)")
     print("S: Speed Settings")
     print("H: Return to Home")
+    print("C: Calibration")
     print("Q: Quit")
 
     while True:
-        cmd = input("Enter option Forward, Reverse, Jog, Speed Settings, Home, Quit (F/R/J/S/H/Q): ").strip().upper()
+        cmd = input("Enter option Forward, Reverse, Jog, Speed Settings, Home, Calibration, Quit (F/R/J/S/H/C/Q): ").strip().upper()
         if cmd == 'F' or cmd == 'f':
             print(f"Moving forward at {int(step_delay * 1000)} ms/step...")
             move_stepper(seq, steps_per_move, step_delay, direction= 1)
@@ -305,15 +335,20 @@ def main():
         elif cmd == 'S' or cmd == 's':
             step_delay = set_speed(step_delay)
             flush_input()
+
         elif cmd == 'H' or cmd == 'h': 
             print("Homing, please stand by")
             #go_home(step_delay)
+        elif cmd == 'C' or cmd == 'c':
+            print("Starting Calibration")
+            calibration()
+
         elif cmd == 'Q' or cmd == 'q':
             print("Quitting.")
             flush_input()
             break
         else:
-            print("Invalid option. Enter F, R, J, S, H, or Q.")
+            print("Invalid option. Enter F, R, J, S, H, C, or Q.")
             flush_input()
     for pin in pins:
         board.digital[pin].write(0)
