@@ -47,7 +47,7 @@ last_switch2_state = None
 transition_sequence = []
 
 # determined by calibration
-steps_per_rev = 0
+steps_per_rev = 100
 revs_per_rotation = 0 
 delta_steps = 0 
 
@@ -222,9 +222,15 @@ def calibration():
 
     steps_per_rev = step_count
     print("Steps per rev are ",steps_per_rev)
+    time.sleep(3)
 
-    #print("\n--- Starting Calibration ---")
-    #print("Now Taking bets on how many revs+steps it takes to make it home brrrrrrrrrrrr")
+    print("\n--- Starting Calibration of Worm Gear---")
+    print("Please first use jog mode to manually set the larger worm gear to home position to continue")
+
+    jog_mode2(step_delay= 0.001)
+
+    print("big gear home")
+    return
 
 
 
