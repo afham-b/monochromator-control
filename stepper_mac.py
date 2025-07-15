@@ -40,6 +40,7 @@ last_states = ["", ""]
 # used to monitor steps and revolutions of the small disk in revs
 step_count = 0 
 rev_count = 0 
+steps_since_rev = 0
 #boolean to track home
 home = False
 last_switch1_state = None
@@ -68,7 +69,7 @@ step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
 
 def move_stepper(seq, steps,step_delay, direction):
-    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, switch1, switch2
+    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, switch1, switch2, steps_since_rev
     # do NOT reinitialize them here!
     # just update their values as you go
 
@@ -103,6 +104,7 @@ def move_stepper(seq, steps,step_delay, direction):
                     # Check for open->blocked->open
                     if transition_sequence == ["OPEN", "BLOCKED", "OPEN"]:
                         rev_count += 1*direction
+                        steps_since_rev = 0
                         #print(f"Full revolution detected! Total revolutions: {rev_count}")
                         transition_sequence = ["OPEN"]  # reset for next revolution
 
@@ -110,6 +112,7 @@ def move_stepper(seq, steps,step_delay, direction):
             time.sleep(step_delay)
 
         step_count += 1*direction  # After one complete seq, count as one step
+        steps_since_rev += 1
     # Turn all pins off when done
     for pin in pins:
         board.digital[pin].write(0)
@@ -175,61 +178,111 @@ def flush_input():
     termios.tcflush(sys.stdin, termios.TCIFLUSH)
 
 def calibration():
-    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, steps_per_rev, revs_per_rotation
+    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, steps_per_rev, revs_per_rotation, steps_since_rev
     print("\n--- Calibration ---")
+    print("Press 1 to calibrate the SMALL disk (optical switch 1).")
+    print("Press 2 to calibrate the LARGE worm gear disk (optical switch 2).")
+    print("Press Q to quit back to main menu.")
 
-     # --- Steps per rev FORWARD ---
-    print("Calibrating steps per revolution (FORWARD)...")
-    step_count = 0
-    rev_count = 0
-    transition_sequence = ["OPEN"]
-    last_switch1_state = "OPEN"
-
-    #lets reset the small disk to its open if needed and reset steps
     while True:
-        monitor_sensors()
-        if switch1: 
-          move_stepper(seq, 1, step_delay=0.015, direction=1)
-        # Check for one full revolution:
-        if switch1 == 0 or False: 
-            step_count =0
-            print( "Switch 1 open, small disk slit open")
+        choice = input("Select calibration: 1 (small disk), 2 (large disk), Q (quit): ").strip().lower()
+        if choice == '1':
+            # --- Steps per rev FORWARD ---
+            print("Calibrating steps per revolution (SMALL disk, FORWARD)...")
+            transition_sequence = ["OPEN"]
+
+            time.sleep(3)
+            # Move to slit OPEN if not already
+            print("Ensuring small disk slit is OPEN...")
+            while True:
+                monitor_sensors()
+                if not board.digital[optical_pin].read():
+                    step_count = 0
+                    print("Switch 1 open, small disk slit open")
+                    #last_switch1_state = "OPEN"
+                    break
+                move_stepper(seq, 1, step_delay=0.015, direction=1)
+
+            time.sleep(2)
+
+            initial_step_count = step_count
+            initial_rev_count = rev_count
+            # Now do one full revolution (open->block->open)
+            print("Rotating one full revolution of small disk...")
+            initial_state = board.digital[optical_pin].read()
+            found_blocked = False
+            while True:
+                monitor_sensors()
+                move_stepper(seq, 1, step_delay=0.015, direction=1)
+                state = board.digital[optical_pin].read()
+                if not found_blocked and state:
+                    found_blocked = True
+                if found_blocked and not state:
+                    print("Completed one revolution (open->blocked->open).")
+                    break
+            print("Total steps for one revolution of small disk:", step_count)
+            steps_per_rev = step_count-initial_step_count
             break
 
-    time.sleep(3)
-    
-    # lets move the small disk into the block, but COUNT those steps as part of steps/rev
-    while True:
-        monitor_sensors()
-        if switch1 == False: 
-          move_stepper(seq, 1, step_delay=0.015, direction=1)
-        # Check for one full revolution:
-        if switch1: 
-            print( "Switch 1 blocked, small disk slit closed")
-            break
+        elif choice == '2':
+            print("Calibrating worm gear...")
+            print("Please use jog mode to set worm gear to home, quit jog mode, then run calibration steps as needed.")
+            time.sleep(3)
+            jog_mode2(step_delay=0.001)
+            print("Big gear homed, begining calibration")
 
-    time.sleep(0.05)
+            calibration_step_counter =0 
+            initial_rev_count = rev_count
+            calibration_rev=0 
 
-    #lets take it back to home
-    while True:
-        monitor_sensors()
-        if switch1: 
-          move_stepper(seq, 1, step_delay=0.015, direction=1)
-        # Check for one full revolution:
-        if switch1 == 0 or False: 
-            print( "Switch 1 open, small disk slit open")
-            break
+            transition_sequence2 = ["OPEN"]
+            last_switch2_state = "OPEN"
+            found_blocked = False
 
-    steps_per_rev = step_count
-    print("Steps per rev are ",steps_per_rev)
-    time.sleep(3)
+            while True:
+            # Step forward once
+                move_stepper(seq, 1, step_delay=0.001, direction=1)
+                calibration_step_counter += 1 
+                if rev_count - initial_rev_count > 0:
+                    calibration_rev = rev_count-initial_rev_count
+            # Check optical switch 2 state
+                switch2 = board.digital[optical_pin2].read()
+                if switch2 is None:
+                    state2 = "WAITING"
+                elif switch2:
+                    state2 = "BLOCKED"
+                else:
+                    state2 = "OPEN"
+            
+            # Track transition: OPEN -> BLOCKED -> OPEN
+                # if last_switch2_state is not None:
+                #     if state2 != last_switch2_state:
+                #         transition_sequence.append(state2)
+                #         if len(transition_sequence) > 3:
+                #             transition_sequence.pop(0)
+                #         if transition_sequence == ["OPEN", "BLOCKED", "OPEN"]:
+                #             print("Completed one revolution of worm gear!")
+                #             break
 
-    print("\n--- Starting Calibration of Worm Gear---")
-    print("Please first use jog mode to manually set the larger worm gear to home position to continue")
+                state2 = "BLOCKED" if board.digital[optical_pin2].read() else "OPEN"
+                if not found_blocked and state2 == "BLOCKED":
+                    found_blocked = True
+                if found_blocked and state2 == "OPEN":
+                    print("Completed one revolution (open->blocked->open) on worm gear.")
+                    break
+                last_switch2_state = state2  # Update for next loop
 
-    jog_mode2(step_delay= 0.001)
+            print('Number of revs and steps: ', calibration_rev , ' revs , ' ,steps_since_rev, ' steps.')
+            print('Number of total steps: ', calibration_step_counter)
 
-    print("big gear home")
+
+        elif choice == 'q' or 'Q':
+            print("Exiting calibration menu.\n")
+            return
+
+        else:
+            print("Invalid input. Enter 1, 2, or Q.")
+
     return
 
 
