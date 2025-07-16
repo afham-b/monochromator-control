@@ -40,9 +40,13 @@ last_states = ["", ""]
 # used to monitor steps and revolutions of the small disk in revs
 step_count = 0 
 rev_count = 0 
+steps_till_rev = 0
 steps_since_rev = 0
-#boolean to track home
-home = False
+
+ #used this varaible to store the steps takesn untill the first complete discrete rev is done, otherwise these steps are lost
+# revs + delts steps only account for the steps taken AFTER the revs, this varibale will help log the steps before the first rev
+is_1rev_completed = False
+
 last_switch1_state = None
 last_switch2_state = None
 transition_sequence = []
@@ -51,7 +55,15 @@ transition_sequence = []
 steps_per_rev = 100
 # it takes 205 revs + 40 steps for one full gear rotations.
 revs_per_rotation = 205 
-delta_steps = 0 
+delta_steps = 40
+
+#use these variable to set a home. 
+home_steps = 0
+home_revs = 0
+home_delta_steps =0 
+home_pre_rev_steps =0 
+#boolean to track home
+home = False
 
 # Define your step sequence (half-step example)
 seq = [
@@ -70,13 +82,14 @@ step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
 
 def move_stepper(seq, steps,step_delay, direction):
-    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, switch1, switch2, steps_since_rev
+    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, switch1, switch2, steps_per_rev, steps_till_rev, steps_since_rev, is_1rev_completed
     # do NOT reinitialize them here!
     # just update their values as you go
 
     if direction == -1:
         sequence = list(reversed(seq))
     else: sequence = seq
+    
 
     for _ in range(steps):
         for step in sequence:
@@ -105,6 +118,7 @@ def move_stepper(seq, steps,step_delay, direction):
                     # Check for open->blocked->open
                     if transition_sequence == ["OPEN", "BLOCKED", "OPEN"]:
                         rev_count += 1*direction
+                        is_1rev_completed = True
                         steps_since_rev = 0
                         #print(f"Full revolution detected! Total revolutions: {rev_count}")
                         transition_sequence = ["OPEN"]  # reset for next revolution
@@ -114,6 +128,9 @@ def move_stepper(seq, steps,step_delay, direction):
 
         step_count += 1*direction  # After one complete seq, count as one step
         steps_since_rev += 1
+        if is_1rev_completed == False:
+            steps_till_rev += 1
+
     # Turn all pins off when done
     for pin in pins:
         board.digital[pin].write(0)
@@ -367,6 +384,52 @@ def monitor_sensors():
     #     print(f"Sensor 1: {state1} | Sensor 2: {state2}")
     #     last_states[0], last_states[1] = state1, state2  # update in-place
 
+def set_home():
+    global home_delta_steps, home_revs, home_steps, home_pre_rev_steps, step_count, rev_count, delta_steps, home, steps_till_rev, last_switch1_state, last_switch2_state , transition_sequence
+    print("Please use jog mode to set worm gear to home (switch 2 open) quit jog mode, then run home setting steps as needed.")
+    time.sleep(3)
+    jog_mode2(step_delay=0.001)
+
+    init_steps = step_count
+    init_rev_count = rev_count
+    init_delta_steps = delta_steps
+
+    print("Now that the large Worm Gear is set to open, move the motor using jog untill optical home is acheived, then quit jog mode")
+    time.sleep(4)
+    jog_mode2(step_delay=0.001)
+    
+    home_delta_steps = steps_since_rev
+    home_revs = rev_count
+    home_steps = step_count
+    home_pre_rev_steps = steps_till_rev
+    
+    print('Total Steps, total revs, delta steps pre-rev, delta steps post-revs:', home_steps, ' ,' ,home_revs, ' ,',home_pre_rev_steps, ' ,',home_delta_steps )
+
+def home_menu():
+    while True:
+        print("\n--- Home Menu ---")
+        print("1: Go to Home")
+        print("2: Reset Home")
+        print("Q: Return to main menu")
+        choice = input("Choose an option (1/2/Q): ").strip().lower()
+
+        if choice == '1':
+            print("Moving to home position...")
+            #go_home()
+            break
+        elif choice == '2':
+            confirm = input("Are you sure you want to reset home? This will re-set the monochromator. (y/N): ").strip().lower()
+            if confirm == 'y':
+                set_home()
+                break
+            else:
+                print("Reset cancelled. Returning to home menu.")
+        elif choice == 'q':
+            print("Exiting home menu.")
+            break
+        else:
+            print("Invalid option. Please enter 1, 2, or Q.")
+
 
 def main():
     global step_delay
@@ -399,8 +462,7 @@ def main():
             flush_input()
 
         elif cmd == 'H' or cmd == 'h': 
-            print("Homing, please stand by")
-            #go_home(step_delay)
+            home_menu()
         elif cmd == 'C' or cmd == 'c':
             print("Starting Calibration")
             calibration()
