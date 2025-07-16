@@ -49,7 +49,8 @@ transition_sequence = []
 
 # determined by calibration
 steps_per_rev = 100
-revs_per_rotation = 0 
+# it takes 205 revs + 40 steps for one full gear rotations.
+revs_per_rotation = 205 
 delta_steps = 0 
 
 # Define your step sequence (half-step example)
@@ -274,7 +275,9 @@ def calibration():
 
             print('Number of revs and steps: ', calibration_rev , ' revs , ' ,steps_since_rev, ' steps.')
             print('Number of total steps: ', calibration_step_counter)
-
+            print('Resetting worm gear back home, stepping in reverse')
+            time.sleep(5)
+            move_stepper(seq, calibration_step_counter, step_delay=0.001, direction= -1)
 
         elif choice == 'q' or 'Q':
             print("Exiting calibration menu.\n")
