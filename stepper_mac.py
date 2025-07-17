@@ -106,6 +106,9 @@ def move_stepper(seq, steps,step_delay, direction):
             else:
                 state1 = "OPEN"
 
+            if state1 == "OPEN":
+                is_1rev_completed = True
+
             # Track transition sequence for open->blocked->open
             if last_switch1_state is not None:
                 # Only add when state changes
@@ -127,9 +130,10 @@ def move_stepper(seq, steps,step_delay, direction):
             time.sleep(step_delay)
 
         step_count += 1*direction  # After one complete seq, count as one step
-        steps_since_rev += 1
+        steps_since_rev += 1*direction
         if is_1rev_completed == False:
-            steps_till_rev += 1
+            if state1 == "BLOCKED":
+                steps_till_rev += 1*direction
 
     # Turn all pins off when done
     for pin in pins:
@@ -350,7 +354,7 @@ def jog_mode2(step_delay):
             print("step count", step_count)
             print("rev count", rev_count)
         monitor_sensors()
-        time.sleep(0.01)  # Adjust for responsiveness/smoothness
+        time.sleep(0.001)  # Adjust for responsiveness/smoothness
 
     listener.stop()
 
@@ -384,6 +388,36 @@ def monitor_sensors():
     #     print(f"Sensor 1: {state1} | Sensor 2: {state2}")
     #     last_states[0], last_states[1] = state1, state2  # update in-place
 
+def go_home():
+    global step_count, rev_count, steps_till_rev, steps_since_rev
+    global home_revs, home_steps, home_pre_rev_steps, home_delta_steps
+    print("\nMoving to Home Position...")
+
+    # Calculate total steps needed to get back to home
+    # Determine direction: -1 = reverse, 1 = forward
+    rev_diff = rev_count - home_revs
+    step_diff = step_count - home_steps
+
+    print(f"Current revs: {rev_count}, home revs: {home_revs}")
+    print(f"Current steps: {step_count}, home steps: {home_steps}")
+
+    direction = -1 if rev_diff > 0 or (rev_diff == 0 and step_diff > 0) else 1
+
+    # Move full revolutions first
+    if rev_diff != 0:
+        print(f"Moving {abs(rev_diff)} full revs in direction {direction}...")
+        for _ in range(abs(rev_diff)):
+            move_stepper(seq, steps_per_rev, step_delay, direction)
+    
+    # Move remaining steps if not aligned
+    remaining_steps = step_count - home_steps
+    if remaining_steps != 0:
+        print(f"Moving {abs(remaining_steps)} steps in direction {direction}...")
+        move_stepper(seq, abs(remaining_steps), step_delay, direction)
+
+    print("Arrived at home position!")
+
+
 def set_home():
     global home_delta_steps, home_revs, home_steps, home_pre_rev_steps, step_count, rev_count, delta_steps, home, steps_till_rev, last_switch1_state, last_switch2_state , transition_sequence
     print("Please use jog mode to set worm gear to home (switch 2 open) quit jog mode, then run home setting steps as needed.")
@@ -415,7 +449,7 @@ def home_menu():
 
         if choice == '1':
             print("Moving to home position...")
-            #go_home()
+            go_home()
             break
         elif choice == '2':
             confirm = input("Are you sure you want to reset home? This will re-set the monochromator. (y/N): ").strip().lower()
