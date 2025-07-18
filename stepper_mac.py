@@ -389,7 +389,7 @@ def monitor_sensors():
     #     last_states[0], last_states[1] = state1, state2  # update in-place
 
 def go_home():
-    global step_count, rev_count, steps_till_rev, steps_since_rev
+    global step_count, rev_count, steps_till_rev, steps_since_rev, transition_sequence
     global home_revs, home_steps, home_pre_rev_steps, home_delta_steps
     print("\nMoving to Home Position...")
 
@@ -398,22 +398,58 @@ def go_home():
     rev_diff = rev_count - home_revs
     step_diff = step_count - home_steps
 
+    #total steps taking during go_home process
+    homing_steps = 0
+
     print(f"Current revs: {rev_count}, home revs: {home_revs}")
     print(f"Current steps: {step_count}, home steps: {home_steps}")
 
     direction = -1 if rev_diff > 0 or (rev_diff == 0 and step_diff > 0) else 1
 
+    #move the post-revs steps 
+    move_stepper(seq, steps_since_rev, step_delay, direction)
+    homing_steps = homing_steps+ steps_since_rev
+
+    current_rev = rev_count
+    
     # Move full revolutions first
     if rev_diff != 0:
         print(f"Moving {abs(rev_diff)} full revs in direction {direction}...")
-        for _ in range(abs(rev_diff)):
-            move_stepper(seq, steps_per_rev, step_delay, direction)
+        while True:
+            if rev_count != (current_rev + (rev_diff * direction)):
+                move_stepper(seq, 1, step_delay, direction)
+                homing_steps += 1
+            else: 
+                break
+    #move the pre-revs steps + hysteresis 
+
+    overshoot_steps = 50
+    move_stepper(seq, steps_till_rev+overshoot_steps, step_delay, direction)
+    homing_steps = homing_steps + steps_till_rev
     
+    # Move back beyond home by 60 steps in opposite direction, slower
+    opposite_direction = -direction
+    slower_delay = 0.02
+    print(f"Reversing direction by {overshoot_steps + 10} steps (60 steps total) at slower speed.")
+    move_stepper(seq, overshoot_steps + 10, slower_delay, opposite_direction)
+
+    #Slowly approach home position by moving forward 10 steps
+    fine_tune_steps = 10
+    slowest_delay = step_delay * 3
+    print(f"Final forward adjustment of {fine_tune_steps} steps at slowest speed.")
+    move_stepper(seq, fine_tune_steps, slowest_delay, direction)
+
+    step_delay = 0.25
     # Move remaining steps if not aligned
     remaining_steps = step_count - home_steps
-    if remaining_steps != 0:
+    if remaining_steps > 0:
         print(f"Moving {abs(remaining_steps)} steps in direction {direction}...")
         move_stepper(seq, abs(remaining_steps), step_delay, direction)
+        homing_steps = homing_steps + remaining_steps
+
+    while homing_steps < step_diff: 
+        move_stepper(seq, 1, step_delay, direction)
+        homing_steps += 1
 
     print("Arrived at home position!")
 
@@ -472,7 +508,7 @@ def main():
     print("R: Reverse CW")
     print("J: Jog Mode (UP/DOWN arrows)")
     print("S: Speed Settings")
-    print("H: Return to Home")
+    print("H: Home Menu")
     print("C: Calibration")
     print("Q: Quit")
 
