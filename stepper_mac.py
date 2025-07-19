@@ -389,7 +389,7 @@ def monitor_sensors():
     #     last_states[0], last_states[1] = state1, state2  # update in-place
 
 def go_home():
-    global step_count, rev_count, steps_till_rev, steps_since_rev, transition_sequence
+    global step_count, rev_count, steps_till_rev, steps_since_rev, transition_sequence, step_delay
     global home_revs, home_steps, home_pre_rev_steps, home_delta_steps
     print("\nMoving to Home Position...")
 
@@ -447,6 +447,11 @@ def go_home():
         move_stepper(seq, abs(remaining_steps), step_delay, direction)
         homing_steps = homing_steps + remaining_steps
 
+    if remaining_steps < 0:
+        print(f"Moving {abs(remaining_steps)} steps in direction {direction}...")
+        move_stepper(seq, abs(remaining_steps), step_delay, direction*-1)
+        homing_steps = homing_steps + remaining_steps
+
     while homing_steps < step_diff: 
         move_stepper(seq, 1, step_delay, direction)
         homing_steps += 1
@@ -468,10 +473,13 @@ def set_home():
     time.sleep(4)
     jog_mode2(step_delay=0.001)
     
-    home_delta_steps = steps_since_rev
+    #home_delta_steps = steps_since_rev
     home_revs = rev_count
     home_steps = step_count
-    home_pre_rev_steps = steps_till_rev
+    #home_pre_rev_steps = steps_till_rev
+
+    steps_since_rev = 0
+    steps_till_rev = 0
     
     print('Total Steps, total revs, delta steps pre-rev, delta steps post-revs:', home_steps, ' ,' ,home_revs, ' ,',home_pre_rev_steps, ' ,',home_delta_steps )
 
