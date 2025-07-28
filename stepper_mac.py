@@ -1,5 +1,9 @@
 #pip install pyfirmata keyboard
 
+import os
+import logging
+from datetime import datetime
+
 from pyfirmata import Arduino, util 
 import time
 import keyboard
@@ -9,10 +13,18 @@ from pynput import keyboard
 
 
 #windows
-#board = Arduino('COM10')  # Set your Arduino port here
+# try:
+#     board = Arduino('COM10')  # Set your Arduino port here
+# except Exception as e:
+#     print(f"Arduino initialization failed: {e}")
+#     sys.exit(1)
 
 #mac, open terminal and type this for com number ls /dev/tty.*
-board = Arduino('/dev/cu.usbmodem1101')
+try:
+    board = Arduino('/dev/cu.usbmodem1101')
+except Exception as e:
+    print(f"Arduino initialization failed: {e}")
+    sys.exit(1)
 
 pins = [11, 10, 9, 8]  # IN1–IN4 pins on ULN2003
 
@@ -99,6 +111,7 @@ def move_stepper(seq, steps,step_delay, direction):
 
              # Read switch 1 (smaller disk) state each time you move a step
             switch1 = board.digital[optical_pin].read()
+
             if switch1 is None:
                 state1 = "WAITING"
             elif switch1:
@@ -120,11 +133,11 @@ def move_stepper(seq, steps,step_delay, direction):
 
                     # Check for open->blocked->open
                     if transition_sequence == ["OPEN", "BLOCKED", "OPEN"]:
-                        rev_count += 1*direction
+                         #if steps_since_rev > steps_per_rev * 0.8:  # Assuming at least 80% of expected steps before counting a rev
+                        rev_count += 1 * direction
                         is_1rev_completed = True
                         steps_since_rev = 0
-                        #print(f"Full revolution detected! Total revolutions: {rev_count}")
-                        transition_sequence = ["OPEN"]  # reset for next revolution
+                        transition_sequence = ["OPEN"] # reset for next revolution
 
             last_switch1_state = state1
             time.sleep(step_delay)
@@ -342,24 +355,40 @@ def jog_mode2(step_delay):
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
 
+    #orginal running loop, testing other loops for responsiveness
+    # while running:
+    #     if forward_pressed:
+    #         move_stepper(seq, steps =1, step_delay =0.001, direction= 1)
+    #         #for testing    
+    #         print("step count", step_count)
+    #         print("rev count", rev_count)
+    #     if reverse_pressed:
+    #         move_stepper(seq, steps=1, step_delay =0.001, direction= -1)
+    #         #for testing    
+    #         print("step count", step_count)
+    #         print("rev count", rev_count)
+    #     monitor_sensors()
+    #     time.sleep(0.001)  # Adjust for responsiveness/smoothness
+
     while running:
+        step_delay = 0.001  # Set a fixed step delay for responsiveness
         if forward_pressed:
-            move_stepper(seq, steps =1, step_delay =0.001, direction= 1)
-            #for testing    
-            print("step count", step_count)
-            print("rev count", rev_count)
+            move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
+            while forward_pressed:
+                move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
+
         if reverse_pressed:
-            move_stepper(seq, steps=1, step_delay =0.001, direction= -1)
-            #for testing    
-            print("step count", step_count)
-            print("rev count", rev_count)
+            move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
+            while reverse_pressed:
+                move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
+
         monitor_sensors()
-        time.sleep(0.001)  # Adjust for responsiveness/smoothness
+        time.sleep(0.01)  # Adjust for responsiveness/smoothness
 
     listener.stop()
 
 def monitor_sensors():
-    global step_count, rev_count, switch1, switch2
+    global step_count, rev_count, switch1, switch2, last_states
     
     switch1 = board.digital[optical_pin].read()
     switch2 = board.digital[optical_pin2].read()
@@ -375,18 +404,14 @@ def monitor_sensors():
         "OPEN"
     )
  
-    print(f"Sensor 1: {state1} | Sensor 2: {state2}")
+    #print(f"Sensor 1: {state1} | Sensor 2: {state2}")
+    logging.info(f"Sensor 1: {state1} | Sensor 2: {state2}")
 
     if state2 == "OPEN":
-        print("Home position detected! Step count reset to 0.")
-        step_count = 0
-        rev_count = 0
+        #print("Home position detected!.")
+        #step_count = 0
+        #rev_count = 0
         home = True
-
-    #only print if a state has changed 
-    # if (state1, state2) != tuple(last_states):
-    #     print(f"Sensor 1: {state1} | Sensor 2: {state2}")
-    #     last_states[0], last_states[1] = state1, state2  # update in-place
 
 def go_home():
     global step_count, rev_count, steps_till_rev, steps_since_rev, transition_sequence, step_delay
@@ -395,73 +420,94 @@ def go_home():
 
     # Calculate total steps needed to get back to home
     # Determine direction: -1 = reverse, 1 = forward
-    rev_diff = rev_count - home_revs
-    step_diff = step_count - home_steps
+    rev_diff = rev_count 
+    step_diff = step_count
 
     #total steps taking during go_home process
     homing_steps = 0
 
-    print(f"Current revs: {rev_count}, home revs: {home_revs}")
-    print(f"Current steps: {step_count}, home steps: {home_steps}")
+    #print(f"Current revs: {rev_count}, home revs: {home_revs}")
+    #print(f"Current steps: {step_count}, home steps: {home_steps}")
+    #print(f"Revolution difference: {rev_diff}, Step difference: {step_diff}")
+    logging.info(f"Current revs: {rev_count}, home revs: {home_revs}")
+    logging.info(f"Current steps: {step_count}, home steps: {home_steps}")
+    logging.info(f"Revolution difference: {rev_diff}, Step difference: {step_diff}")
+    # Calculate steps to move before reaching home
 
     direction = -1 if rev_diff > 0 or (rev_diff == 0 and step_diff > 0) else 1
 
     #move the post-revs steps 
     move_stepper(seq, steps_since_rev, step_delay, direction)
     homing_steps = homing_steps+ steps_since_rev
+    #print(f"Moving {abs(steps_since_rev)} steps in direction {direction}...")
+    logging.info(f"Moving {abs(steps_since_rev)} steps in direction {direction}...")
 
     current_rev = rev_count
     
     # Move full revolutions first
     if rev_diff != 0:
-        print(f"Moving {abs(rev_diff)} full revs in direction {direction}...")
+        #print(f"Moving {abs(rev_diff)} full revs in direction {direction}...")
+        logging.info(f"Moving {abs(rev_diff)} full revs in direction {direction}...")
         while True:
             if rev_count != (current_rev + (rev_diff * direction)):
                 move_stepper(seq, 1, step_delay, direction)
                 homing_steps += 1
             else: 
                 break
-    #move the pre-revs steps + hysteresis 
+    #print(f"Total revolutions moved: {abs(rev_diff)}")
+    logging.info(f"Total revolutions moved: {abs(rev_diff)}")
 
-    overshoot_steps = 50
-    move_stepper(seq, steps_till_rev+overshoot_steps, step_delay, direction)
-    homing_steps = homing_steps + steps_till_rev
+
+    #move the pre-revs steps + hysteresis 
+    slower_delay = 0.005  # Adjust for slower speed of hysteresis
+
+    overshoot_steps = 20
+    move_stepper(seq, steps_till_rev+overshoot_steps, slower_delay, direction)
+    homing_steps = homing_steps + steps_till_rev + overshoot_steps
+    print(f"Moving {abs(steps_till_rev + overshoot_steps)} steps in direction {direction} at slower speed...")
     
     # Move back beyond home by 60 steps in opposite direction, slower
-    opposite_direction = -direction
-    slower_delay = 0.02
-    print(f"Reversing direction by {overshoot_steps + 10} steps (60 steps total) at slower speed.")
-    move_stepper(seq, overshoot_steps + 10, slower_delay, opposite_direction)
+    opposite_direction = -1* direction
+    
+    reverse_overshoot_steps = 10
+
+    print(f"Reversing direction by {overshoot_steps} steps (60 steps total) at slower speed.")
+    move_stepper(seq, overshoot_steps + reverse_overshoot_steps, slower_delay, opposite_direction)
+    homing_steps = homing_steps - (reverse_overshoot_steps)
+
+    slowest_delay = slower_delay * 2
 
     #Slowly approach home position by moving forward 10 steps
     fine_tune_steps = 10
-    slowest_delay = step_delay * 3
-    print(f"Final forward adjustment of {fine_tune_steps} steps at slowest speed.")
+    #print(f"Final forward adjustment of {fine_tune_steps} steps at slowest speed.")
     move_stepper(seq, fine_tune_steps, slowest_delay, direction)
 
-    step_delay = 0.25
     # Move remaining steps if not aligned
-    remaining_steps = step_count - home_steps
-    if remaining_steps > 0:
-        print(f"Moving {abs(remaining_steps)} steps in direction {direction}...")
-        move_stepper(seq, abs(remaining_steps), step_delay, direction)
-        homing_steps = homing_steps + remaining_steps
+    remaining_steps = step_diff - homing_steps
+    print(f"Remaining steps to home: {remaining_steps}")
+    time.sleep(5)
 
-    if remaining_steps < 0:
-        print(f"Moving {abs(remaining_steps)} steps in direction {direction}...")
-        move_stepper(seq, abs(remaining_steps), step_delay, direction*-1)
-        homing_steps = homing_steps + remaining_steps
+    # If remaining steps is zero, we are already at home
+    while remaining_steps != 0:
+        if remaining_steps > 0:
 
-    while homing_steps < step_diff: 
-        move_stepper(seq, 1, step_delay, direction)
-        homing_steps += 1
+            print(f"Moving {abs(remaining_steps)} steps in direction {direction}...")
+            move_stepper(seq, abs(remaining_steps), slowest_delay, direction)
+            homing_steps = homing_steps + remaining_steps
+
+        if remaining_steps < 0:
+            print(f"Moving {abs(remaining_steps)} steps in direction {direction}...")
+            move_stepper(seq, abs(remaining_steps), slowest_delay, -1*direction)
+            homing_steps = homing_steps - remaining_steps
+        # Recalculate remaining steps
+        remaining_steps = step_count
 
     print("Arrived at home position!")
 
 
 def set_home():
     global home_delta_steps, home_revs, home_steps, home_pre_rev_steps, step_count, rev_count, delta_steps, home, steps_till_rev, last_switch1_state, last_switch2_state , transition_sequence
-    print("Please use jog mode to set worm gear to home (switch 2 open) quit jog mode, then run home setting steps as needed.")
+    print("Please use jog mode to set worm gear to home (switch 2 open) quit jog mode.")
     time.sleep(3)
     jog_mode2(step_delay=0.001)
 
@@ -469,15 +515,18 @@ def set_home():
     init_rev_count = rev_count
     init_delta_steps = delta_steps
 
-    print("Now that the large Worm Gear is set to open, move the motor using jog untill optical home is acheived, then quit jog mode")
-    time.sleep(4)
-    jog_mode2(step_delay=0.001)
+    # print("Now that the large Worm Gear is set to open, move the motor using jog untill optical home is acheived, then quit jog mode")
+    # time.sleep(4)
+    # jog_mode2(step_delay=0.001)
     
     #home_delta_steps = steps_since_rev
     home_revs = rev_count
     home_steps = step_count
     #home_pre_rev_steps = steps_till_rev
 
+    # Explicitly reset counts when setting new home
+    step_count = 0  # Reset step count when explicitly setting home
+    rev_count = 0   # Reset revolution count
     steps_since_rev = 0
     steps_till_rev = 0
     
@@ -509,8 +558,44 @@ def home_menu():
             print("Invalid option. Please enter 1, 2, or Q.")
 
 
+def wait_for_initial_sensor_states():
+    global switch1, switch2
+    while switch1 is None or switch2 is None:
+        switch1 = board.digital[optical_pin].read()
+        switch2 = board.digital[optical_pin2].read()
+        time.sleep(0.01)  # Wait briefly
+
+def setup_logging():
+    # Create logs directory if it doesn't exist
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # Create timestamp for filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"logs/stepper_log_{timestamp}.txt"
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler()
+        ]
+    )
+    return log_filename
+
+
 def main():
     global step_delay
+
+    wait_for_initial_sensor_states    
+
+    # Initialize logging
+    log_file = setup_logging()
+    logging.info(f"Starting stepper motor control - logging to {log_file}")
+
     print("Stepper Motor Control")
     print("F: Forward CCW")
     print("R: Reverse CW")
@@ -522,30 +607,30 @@ def main():
 
     while True:
         cmd = input("Enter option Forward, Reverse, Jog, Speed Settings, Home, Calibration, Quit (F/R/J/S/H/C/Q): ").strip().upper()
-        if cmd == 'F' or cmd == 'f':
+        if cmd in ('F','f'):
             print(f"Moving forward at {int(step_delay * 1000)} ms/step...")
             move_stepper(seq, steps_per_move, step_delay, direction= 1)
             flush_input()
-        elif cmd == 'R' or cmd == 'r':
+        elif cmd in ('R', 'r'):
             print(f"Moving reverse at {int(step_delay * 1000)} ms/step...")
             move_stepper(seq, steps_per_move, step_delay, direction= -1)
             flush_input()
-        elif cmd == 'J' or cmd == 'j':
+        elif cmd in ('J', 'j'):
             #jog_mode(step_delay)
             # for mac, jog2 function uses pynput instead of keyboard package
             jog_mode2(step_delay)
             flush_input()
-        elif cmd == 'S' or cmd == 's':
+        elif cmd in ('S', 's'):
             step_delay = set_speed(step_delay)
             flush_input()
 
-        elif cmd == 'H' or cmd == 'h': 
+        elif cmd in ('H','h'): 
             home_menu()
-        elif cmd == 'C' or cmd == 'c':
+        elif cmd in ('C','c'):
             print("Starting Calibration")
             calibration()
 
-        elif cmd == 'Q' or cmd == 'q':
+        elif cmd in ('q', 'Q'):
             print("Quitting.")
             flush_input()
             break
