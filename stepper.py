@@ -1,10 +1,31 @@
 #pip install pyfirmata keyboard
 
-from pyfirmata import Arduino
+import os
+import logging
+from datetime import datetime
+
+from pyfirmata import Arduino, util 
 import time
 import keyboard
+import sys
+import termios
+from pynput import keyboard
 
-board = Arduino('COM10')  # Set your Arduino port here
+#windows
+# try:
+#     board = Arduino('COM10')  # Set your Arduino port here
+# except Exception as e:
+#     print(f"Arduino initialization failed: {e}")
+#     sys.exit(1)
+
+#mac, open terminal and type this for com number ls /dev/tty.*
+try:
+    board = Arduino('/dev/cu.usbmodem1101')
+except Exception as e:
+    print(f"Arduino initialization failed: {e}")
+    sys.exit(1)
+
+
 
 pins = [11, 10, 9, 8]  # IN1–IN4 pins on ULN2003
 
@@ -17,7 +38,8 @@ seq = [
     [0,1,1,0],
     [0,0,1,0],
     [0,0,1,1],
-    [0,0,0,1]
+    [0,0,0,1],
+    [1,0,0,1]
 ]
 
 step_delay = 0.001  # 01ms (adjust for your setup)

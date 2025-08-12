@@ -49,6 +49,13 @@ switch2 = board.digital[optical_pin2].read()
 #use to initialize an array to track the switch states 
 last_states = ["", ""]
 
+
+# attempting directional bias & backlash compensation
+DIR_REVERSE_SCALE = 1.0      # multiply reverse steps by this (steady-state)
+BACKLASH_STEPS = 0           # extra steps to take up slack when changing direction
+_last_move_dir = None        # track direction to detect direction changes
+_rev_scale_err_accum = 0.0   # fractional accumulator for reverse scaling
+
 # used to monitor steps and revolutions of the small disk in revs
 step_count = 0 
 rev_count = 0 
@@ -92,6 +99,34 @@ seq = [
 
 step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
+
+def move_biased(steps, step_delay, direction):
+    # Apply direction-change backlash and steady-state reverse scaling.
+    global _last_move_dir, _rev_scale_err_accum
+
+    # If direction changes, take up backlash in the new direction first.
+    if _last_move_dir is not None and direction != _last_move_dir:
+        if BACKLASH_STEPS > 0:
+            # Take up slack. These are "compensation" steps; you can treat them
+            # as physical-only, but since your counters track actual motion,
+            # letting them count is fine.
+            move_stepper(seq, BACKLASH_STEPS, step_delay, direction)
+
+    # Scale reverse steps for steady-state bias
+    adj_steps = steps
+    if direction == -1 and DIR_REVERSE_SCALE != 1.0:
+        # Keep fractional error small via accumulator
+        _rev_scale_err_accum += steps * DIR_REVERSE_SCALE
+        adj_steps = int(round(_rev_scale_err_accum))
+        _rev_scale_err_accum -= adj_steps
+
+        # Ensure at least one step if nonzero commanded
+        if steps > 0 and adj_steps == 0:
+            adj_steps = 1
+
+    move_stepper(seq, adj_steps, step_delay, direction)
+    _last_move_dir = direction
+
 
 def move_stepper(seq, steps,step_delay, direction):
     global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, switch1, switch2, steps_per_rev, steps_till_rev, steps_since_rev, is_1rev_completed
@@ -186,14 +221,16 @@ def jog_mode(step_delay):
                 print("Exiting jog mode.\n")
                 break
             elif keyboard.is_pressed('up'):
-                move_stepper(seq, steps=1, step_delay =0.001, direction= 1)
+                #move_stepper(seq, steps=1, step_delay =0.001, direction= 1)
+                move_biased(steps_per_move=1, step_delay=0.001, direction=1)
                  #for testing    
                 print("step count", step_count)
                 print("rev count", rev_count)
 
             elif keyboard.is_pressed('down'):
                 # Move one step in reverse
-                move_stepper(seq, steps =1, step_delay =0.001, direction= -1)
+                #move_stepper(seq, steps =1, step_delay =0.001, direction= -1)
+                move_biased(steps_per_move=1, step_delay=0.001, direction=-1)
                  #for testing    
                 print("step count", step_count)
                 print("rev count", rev_count)
@@ -212,11 +249,108 @@ def jog_mode(step_delay):
 def flush_input():
     termios.tcflush(sys.stdin, termios.TCIFLUSH)
 
+def _sensor_state(pin):
+    #Return True if BLOCKED, False if OPEN (None treated as last seen).
+    val = board.digital[pin].read()
+    return bool(val) if val is not None else True  # default to BLOCKED if None
+
+def _seek_open_edge(pin, approach_dir, step_delay=0.004):
+    
+    #move until we're exactly on the BLOCKED->OPEN edge, approaching in the given direction (for repeatable indexing).
+
+    # If currently OPEN, step until BLOCKED
+    while _sensor_state(pin) is False:
+        move_stepper(seq, 1, step_delay, approach_dir)
+
+    # Now we're BLOCKED: step until it flips to OPEN (that's the edge)
+    while _sensor_state(pin) is True:
+        move_stepper(seq, 1, step_delay, approach_dir)
+    # Now we're at the edge (first OPEN after BLOCKED), aligned reproducibly.
+
+def _measure_one_cycle_steps(pin, direction, step_delay=0.003, max_steps=100000):
+    #Starting *exactly at the OPEN edge*, count steps for one full sensor cycle: 
+    # OPEN -> (leave OPEN to BLOCKED) -> return to OPEN. Returns step count.
+    
+    steps = 0
+    left_open = False
+    prev = False  # we start on OPEN edge by contract
+    for _ in range(max_steps):
+        move_stepper(seq, 1, step_delay, direction)
+        steps += 1
+        cur = _sensor_state(pin)
+        if not left_open:
+            # wait until we leave OPEN (hit BLOCKED)
+            if cur is True:
+                left_open = True
+        else:
+            # after we've been BLOCKED, look for OPEN again
+            if cur is False:
+                return steps
+        prev = cur
+    # If we somehow didn't complete a cycle, return what we counted.
+    return steps
+
+def calibrate_directional_bias(pin=optical_pin, approach_dir=1, verbose=True):
+    """
+    Measures:
+      - FORWARD steady steps for 1 sensor cycle
+      - REVERSE steps for first cycle (includes backlash from direction change)
+      - REVERSE steps for second cycle (steady reverse, no direction change)
+    Computes:
+      BACKLASH_STEPS = first_reverse - reverse_steady
+      DIR_REVERSE_SCALE = forward_steady / reverse_steady
+    """
+    global DIR_REVERSE_SCALE, BACKLASH_STEPS
+
+    # Index to a consistent edge in forward direction
+    _seek_open_edge(pin, approach_dir=approach_dir, step_delay=0.004)
+
+    # 1) Forward steady cycle
+    f_steps = _measure_one_cycle_steps(pin, direction=+1, step_delay=0.003)
+
+    # We should now be again on the OPEN edge, but 1 rev forward.
+    # 2) First reverse cycle (this includes backlash due to direction change)
+    r_first = _measure_one_cycle_steps(pin, direction=-1, step_delay=0.003)
+
+    # Now we are back at an OPEN edge again.
+    # 3) Second reverse cycle (steady reverse, no direction change)
+    r_steady = _measure_one_cycle_steps(pin, direction=-1, step_delay=0.003)
+
+    # Compute compensation
+    backlash = max(0, r_first - r_steady)  # backlash can't be negative
+    reverse_scale = (f_steps / r_steady) if r_steady > 0 else 1.0
+
+    # Save results
+    BACKLASH_STEPS = int(round(backlash))
+    DIR_REVERSE_SCALE = float(reverse_scale)
+
+    if verbose:
+        print("=== Directional Bias Calibration ===")
+        print(f"Forward steady rev steps:        {f_steps}")
+        print(f"Reverse first rev (with backlash): {r_first}")
+        print(f"Reverse steady rev steps:         {r_steady}")
+        print(f"-> BACKLASH_STEPS:               {BACKLASH_STEPS}")
+        print(f"-> DIR_REVERSE_SCALE:            {DIR_REVERSE_SCALE:.6f}")
+        if abs(DIR_REVERSE_SCALE - 1.0) < 0.01:
+            print("Note: Reverse scale ~1.0 (little steady-state directional bias).")
+        else:
+            print("Note: Non-unity reverse scale detected (steady-state bias).")
+
+    return {
+        "forward_steps": f_steps,
+        "reverse_first": r_first,
+        "reverse_steady": r_steady,
+        "backlash_steps": BACKLASH_STEPS,
+        "reverse_scale": DIR_REVERSE_SCALE,
+    }
+
+
 def calibration():
     global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, steps_per_rev, revs_per_rotation, steps_since_rev
     print("\n--- Calibration ---")
     print("Press 1 to calibrate the SMALL disk (optical switch 1).")
     print("Press 2 to calibrate the LARGE worm gear disk (optical switch 2).")
+    print("Press 3 to calibrate directional bias/backlash on SMALL disk (optical switch 1).")
     print("Press Q to quit back to main menu.")
 
     while True:
@@ -257,6 +391,7 @@ def calibration():
                     break
             print("Total steps for one revolution of small disk:", step_count)
             steps_per_rev = step_count-initial_step_count
+
             break
 
         elif choice == '2':
@@ -312,6 +447,11 @@ def calibration():
             print('Resetting worm gear back home, stepping in reverse')
             time.sleep(5)
             move_stepper(seq, calibration_step_counter, step_delay=0.001, direction= -1)
+
+        elif choice == '3':
+            print("Calibrating directional bias/backlash on small disk (sensor 1)...")
+            result = calibrate_directional_bias(pin=optical_pin, approach_dir=+1, verbose=True)
+
 
         elif choice == 'q' or 'Q':
             print("Exiting calibration menu.\n")
@@ -373,14 +513,18 @@ def jog_mode2(step_delay):
     while running:
         step_delay = 0.001  # Set a fixed step delay for responsiveness
         if forward_pressed:
-            move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
+            #move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
+            move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
             while forward_pressed:
-                move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
+                #move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
+                move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
 
         if reverse_pressed:
-            move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
+            #move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
+            move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
             while reverse_pressed:
-                move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
+                #move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
+                move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
 
         monitor_sensors()
         time.sleep(0.01)  # Adjust for responsiveness/smoothness
@@ -437,7 +581,9 @@ def go_home():
     direction = -1 if rev_diff > 0 or (rev_diff == 0 and step_diff > 0) else 1
 
     #move the post-revs steps 
-    move_stepper(seq, steps_since_rev, step_delay, direction)
+    #move_stepper(seq, steps_since_rev, step_delay, direction)
+    move_biased(steps_per_move=1, step_delay=step_delay, direction=direction)
+
     homing_steps = homing_steps+ steps_since_rev
     #print(f"Moving {abs(steps_since_rev)} steps in direction {direction}...")
     logging.info(f"Moving {abs(steps_since_rev)} steps in direction {direction}...")
@@ -450,7 +596,8 @@ def go_home():
         logging.info(f"Moving {abs(rev_diff)} full revs in direction {direction}...")
         while True:
             if rev_count != (current_rev + (rev_diff * direction)):
-                move_stepper(seq, 1, step_delay, direction)
+                #move_stepper(seq, 1, step_delay, direction)
+                move_biased(steps_per_move=1, step_delay=step_delay, direction=direction)
                 homing_steps += 1
             else: 
                 break
@@ -462,7 +609,8 @@ def go_home():
     slower_delay = 0.005  # Adjust for slower speed of hysteresis
 
     overshoot_steps = 20
-    move_stepper(seq, steps_till_rev+overshoot_steps, slower_delay, direction)
+    #move_stepper(seq, steps_till_rev+overshoot_steps, slower_delay, direction)
+    move_biased(steps_till_rev+overshoot_steps, step_delay=slower_delay, direction=direction)
     homing_steps = homing_steps + steps_till_rev + overshoot_steps
     print(f"Moving {abs(steps_till_rev + overshoot_steps)} steps in direction {direction} at slower speed...")
     
@@ -472,7 +620,8 @@ def go_home():
     reverse_overshoot_steps = 10
 
     print(f"Reversing direction by {overshoot_steps} steps (60 steps total) at slower speed.")
-    move_stepper(seq, overshoot_steps + reverse_overshoot_steps, slower_delay, opposite_direction)
+    #move_stepper(seq, overshoot_steps + reverse_overshoot_steps, slower_delay, opposite_direction)
+    move_biased(overshoot_steps + reverse_overshoot_steps, step_delay=slower_delay, direction=opposite_direction)
     homing_steps = homing_steps - (reverse_overshoot_steps)
 
     slowest_delay = slower_delay * 2
@@ -480,7 +629,8 @@ def go_home():
     #Slowly approach home position by moving forward 10 steps
     fine_tune_steps = 10
     #print(f"Final forward adjustment of {fine_tune_steps} steps at slowest speed.")
-    move_stepper(seq, fine_tune_steps, slowest_delay, direction)
+    #move_stepper(seq, fine_tune_steps, slowest_delay, direction)
+    move_biased(fine_tune_steps, step_delay=slowest_delay, direction=direction)
 
     # Move remaining steps if not aligned
     remaining_steps = step_diff - homing_steps
@@ -492,12 +642,14 @@ def go_home():
         if remaining_steps > 0:
 
             print(f"Moving {abs(remaining_steps)} steps in direction {direction}...")
-            move_stepper(seq, abs(remaining_steps), slowest_delay, direction)
+            #move_stepper(seq, abs(remaining_steps), slowest_delay, direction)
+            move_biased(abs(remaining_steps), step_delay=slowest_delay, direction=direction)
             homing_steps = homing_steps + remaining_steps
 
         if remaining_steps < 0:
             print(f"Moving {abs(remaining_steps)} steps in direction {direction}...")
-            move_stepper(seq, abs(remaining_steps), slowest_delay, -1*direction)
+            #move_stepper(seq, abs(remaining_steps), slowest_delay, -1*direction)
+            move_biased(abs(remaining_steps), step_delay=slowest_delay, direction=-1*direction)
             homing_steps = homing_steps - remaining_steps
         # Recalculate remaining steps
         remaining_steps = step_count
@@ -609,11 +761,13 @@ def main():
         cmd = input("Enter option Forward, Reverse, Jog, Speed Settings, Home, Calibration, Quit (F/R/J/S/H/C/Q): ").strip().upper()
         if cmd in ('F','f'):
             print(f"Moving forward at {int(step_delay * 1000)} ms/step...")
-            move_stepper(seq, steps_per_move, step_delay, direction= 1)
+            #move_stepper(seq, steps_per_move, step_delay, direction= 1)
+            move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
             flush_input()
         elif cmd in ('R', 'r'):
             print(f"Moving reverse at {int(step_delay * 1000)} ms/step...")
-            move_stepper(seq, steps_per_move, step_delay, direction= -1)
+            #move_stepper(seq, steps_per_move, step_delay, direction= -1)
+            move_biased(steps_per_move=1, step_delay=step_delay, direction=-1)
             flush_input()
         elif cmd in ('J', 'j'):
             #jog_mode(step_delay)
