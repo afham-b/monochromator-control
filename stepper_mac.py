@@ -84,6 +84,17 @@ home_pre_rev_steps =0
 #boolean to track home
 home = False
 
+# --- Homing config (tune as needed) ---
+HOME_OFFSET_DIR = {+1: 15, -1: 15}  # steps from S2 center toward the approach_dir to exact home
+FAST_STEP_DELAY   = 0.001
+EDGE_STEP_DELAY   = 0.004
+CENTER_STEP_DELAY = 0.006
+TWEAK_STEP_DELAY  = 0.008
+MAX_FIND_STEPS    = 20000       # hard cap so loops can't run forever
+TWEAK_RANGE       = 40           # +/- small steps to satisfy "both open"
+FAR_STEP_THRESHOLD = 200   # steps to consider "far" for fast pre-roll
+
+
 # Define your step sequence (half-step example)
 seq = [
     [1,0,0,1],
@@ -178,10 +189,11 @@ def move_stepper(seq, steps,step_delay, direction):
             time.sleep(step_delay)
 
         step_count += 1*direction  # After one complete seq, count as one step
+
         steps_since_rev += 1*direction
-        if is_1rev_completed == False:
-            if state1 == "BLOCKED":
-                steps_till_rev += 1*direction
+
+        if is_1rev_completed == False and state1 == "BLOCKED":
+            steps_till_rev += 1 *direction
 
     # Turn all pins off when done
     for pin in pins:
@@ -222,7 +234,7 @@ def jog_mode(step_delay):
                 break
             elif keyboard.is_pressed('up'):
                 #move_stepper(seq, steps=1, step_delay =0.001, direction= 1)
-                move_biased(steps_per_move=1, step_delay=0.001, direction=1)
+                move_biased(steps = 1, step_delay=0.001, direction=1)
                  #for testing    
                 print("step count", step_count)
                 print("rev count", rev_count)
@@ -230,7 +242,7 @@ def jog_mode(step_delay):
             elif keyboard.is_pressed('down'):
                 # Move one step in reverse
                 #move_stepper(seq, steps =1, step_delay =0.001, direction= -1)
-                move_biased(steps_per_move=1, step_delay=0.001, direction=-1)
+                move_biased(steps =1, step_delay=0.001, direction=-1)
                  #for testing    
                 print("step count", step_count)
                 print("rev count", rev_count)
@@ -514,17 +526,17 @@ def jog_mode2(step_delay):
         step_delay = 0.001  # Set a fixed step delay for responsiveness
         if forward_pressed:
             #move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
-            move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
+            move_biased(steps =1, step_delay=step_delay, direction=1)
             while forward_pressed:
                 #move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
-                move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
+                move_biased(steps =1, step_delay=step_delay, direction=1)
 
         if reverse_pressed:
             #move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
-            move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
+            move_biased(steps =1, step_delay=step_delay, direction=-1)
             while reverse_pressed:
                 #move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
-                move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
+                move_biased(steps =1, step_delay=step_delay, direction=-1)
 
         monitor_sensors()
         time.sleep(0.01)  # Adjust for responsiveness/smoothness
@@ -532,7 +544,7 @@ def jog_mode2(step_delay):
     listener.stop()
 
 def monitor_sensors():
-    global step_count, rev_count, switch1, switch2, last_states
+    global step_count, rev_count, switch1, switch2, last_states, home 
     
     switch1 = board.digital[optical_pin].read()
     switch2 = board.digital[optical_pin2].read()
@@ -556,6 +568,210 @@ def monitor_sensors():
         #step_count = 0
         #rev_count = 0
         home = True
+
+def read_state(pin):
+    """Return True if BLOCKED, False if OPEN. Treat None as last known; assume BLOCKED at startup."""
+    val = board.digital[pin].read()
+    return bool(val) if val is not None else True
+
+
+def _read_blocked(pin, retries=5):
+    # True=BLOCKED, False=OPEN, retry to avoid None flicker
+    for _ in range(retries):
+        v = board.digital[pin].read()
+        if v is not None:
+            return bool(v)
+        time.sleep(0.002)
+    return True  # conservative default
+
+def _step_until_state(pin, target_blocked, direction, step_delay, max_steps=MAX_FIND_STEPS):
+    # Step in 'direction' until sensor matches target_blocked
+    for i in range(max_steps):
+        if _read_blocked(pin) == target_blocked:
+            return i
+        move_biased(1, step_delay, direction)
+    raise RuntimeError("step_until_state: exceeded MAX_FIND_STEPS")
+
+
+def _find_B2O_and_measure_open(pin, direction, first_fast=True):
+    """
+    Force BLOCKED, then step until first OPEN (BLOCKED->OPEN edge),
+    continue stepping while OPEN to measure window width (in steps).
+    Returns open_width (integer). Ends at OPEN->BLOCKED far edge.
+    """
+
+    # Force BLOCKED, then hit the BLOCKED->OPEN edge, then measure OPEN width.
+    _step_until_state(pin, True,  direction, FAST_STEP_DELAY if first_fast else EDGE_STEP_DELAY)
+    _step_until_state(pin, False, direction, EDGE_STEP_DELAY)
+
+
+    # Now inside OPEN region, count width while staying OPEN
+    width = 0
+    for _ in range(MAX_FIND_STEPS):
+        if _read_blocked(pin):      # left OPEN → at far edge
+            break
+        move_biased(1, EDGE_STEP_DELAY, direction)
+        width += 1
+    if width == 0:
+        raise RuntimeError("Open window width measured as 0")
+    return width
+
+def _center_on_open_window(pin, approach_dir):
+    """
+    Centers the sensor on the OPEN window using the chosen approach_dir.
+    We land at the far (OPEN->BLOCKED) edge and reverse by half width.
+    Backlash is handled by move_biased().
+    """
+    w = _find_B2O_and_measure_open(pin, direction=approach_dir, first_fast=True)
+    half = max(1, w // 2)
+    move_biased(half, CENTER_STEP_DELAY, -approach_dir)  # reverse half to center
+    return w
+
+def _both_open():
+    return (not _read_blocked(optical_pin2)) and (not _read_blocked(optical_pin))
+
+def _micro_tweak_around_center(approach_dir):
+    """
+    Small bounded search to satisfy 'both sensors OPEN', without runaway.
+    Tries +dir for a few steps, then -dir, then returns to nearest found.
+    """
+    if _both_open():
+        return True
+
+    moved_fwd = 0
+    for i in range(1, TWEAK_RANGE + 1):
+        move_biased(1, TWEAK_STEP_DELAY, approach_dir)
+        moved_fwd += 1
+        if _both_open():
+            return True
+
+    # go back past center the other way
+    move_biased(moved_fwd, TWEAK_STEP_DELAY, -approach_dir)
+    moved_back = 0
+    for i in range(1, TWEAK_RANGE + 1):
+        move_biased(1, TWEAK_STEP_DELAY, -approach_dir)
+        moved_back += 1
+        if _both_open():
+            return True
+
+    # Return to center-ish
+    move_biased(moved_back, TWEAK_STEP_DELAY, approach_dir)
+    return _both_open()
+
+
+def move_until_state(pin, target_blocked, direction, step_delay, max_steps=200000):
+    """
+    Step until pin reaches target state. Returns steps moved (>=0).
+    Aborts safely at max_steps.
+    """
+    steps = 0
+    for _ in range(max_steps):
+        cur = read_state(pin)
+        if cur == target_blocked:
+            return steps
+        move_biased(1, step_delay, direction)
+        steps += 1
+    return steps  # hit limit (fail-safe)
+
+def capture_rising_open(pin, approach_dir, backoff_steps, fast_delay, slow_delay):
+    """
+    Hysteresis pass:
+      1) Ensure we're on BLOCKED side
+      2) Approach rising edge (BLOCKED->OPEN) at fast_delay
+      3) Back off a little and re-approach more slowly at slow_delay
+    Return total steps moved (not used for logic; just for logs).
+    """
+    total = 0
+    # Ensure BLOCKED (move from OPEN to BLOCKED in opposite direction)
+    if read_state(pin) is False:  # OPEN
+        total += move_until_state(pin, target_blocked=True, direction=-approach_dir, step_delay=fast_delay)
+
+    # First approach to OPEN (fast)
+    total += move_until_state(pin, target_blocked=False, direction=approach_dir, step_delay=fast_delay)
+
+    # Back off a bit into BLOCKED
+    move_biased(backoff_steps, fast_delay, -approach_dir); total += backoff_steps
+    move_until_state(pin, target_blocked=True, direction=-approach_dir, step_delay=fast_delay)  # ensure BLOCKED
+
+    # Second approach to OPEN (slow)
+    total += move_until_state(pin, target_blocked=False, direction=approach_dir, step_delay=slow_delay)
+
+    return total
+
+def find_window_edges(pin, direction, step_delay, max_steps=100000):
+    """
+    Starting wherever we are, find OPEN window edges for `pin` by:
+      - Ensure we are BLOCKED
+      - Step until OPEN -> that's rising edge (A)
+      - Continue until BLOCKED -> that's falling edge (B)
+    Returns (A_to_B_width, steps_A, steps_B) relative to where we call it.
+    """
+    # Ensure BLOCKED
+    if read_state(pin) is False:  # OPEN
+        move_until_state(pin, target_blocked=True, direction=-direction, step_delay=step_delay)
+
+    # Rising edge to OPEN
+    steps_A = move_until_state(pin, target_blocked=False, direction=direction, step_delay=step_delay)
+
+    # Continue to falling edge back to BLOCKED
+    steps_B = steps_A + move_until_state(pin, target_blocked=True, direction=direction, step_delay=step_delay)
+
+    width = steps_B - steps_A
+    return width, steps_A, steps_B
+
+
+#edge + step based homing function, as opposed to the only step based homing function gohome() 
+def go_home2():
+    """
+    Shortest-path homing:
+      1) Choose approach_dir from signed step_count (short way back).
+      2) On switch 2, approach BLOCKED->OPEN edge in that direction,
+         measure OPEN width, reverse half to center (backlash compensated).
+      3) Apply per-direction home offset to reproduce your calibrated 'both-open' home.
+      4) Micro-tweak a few steps to satisfy both sensors OPEN (bounded, no runaway).
+    """
+    global step_count
+
+    # 0) Pick shortest approach: +steps => go CW (-1), -steps => go CCW (+1)
+    approach_dir = -1 if step_count >= 0 else +1
+
+    # 1) Fast pre-roll if far away (uses counters only to save time; sensor-indexing comes next)
+    steps_far = abs(step_count)
+    if steps_far > FAR_STEP_THRESHOLD:
+        fast_steps = steps_far - FAR_STEP_THRESHOLD
+        move_biased(fast_steps, FAST_STEP_DELAY, approach_dir)
+
+    # 2) Index & center on S2 OPEN window (direction-aware; uses sensors only)
+    try:
+        open_w = _center_on_open_window(optical_pin2, approach_dir)
+        print(f"S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
+    except RuntimeError as e:
+        print(f"[Homing] S2 centering failed: {e}")
+        return
+
+    # 3) Apply small per-direction offset from S2 center to your true home
+    off = int(HOME_OFFSET_DIR.get(approach_dir, 0))
+    if off:
+        move_biased(off, CENTER_STEP_DELAY, approach_dir)
+
+    # 4) Optional light hysteresis settle: overshoot a tiny bit and return
+    # (kept small so it never runs long)
+    move_biased(3, CENTER_STEP_DELAY, approach_dir)
+    move_biased(3, CENTER_STEP_DELAY, -approach_dir)
+
+    # Uncomment if you want to bias using a static offset number of steps that are known
+    # if approach_dir == 1:
+    #     move_biased(8, EDGE_STEP_DELAY, 1)
+    # else:
+    #     move_biased(2, EDGE_STEP_DELAY, -1)
+
+    # 5) Ensure both sensors OPEN (bounded micro-tweak, no infinite while)
+    if _micro_tweak_around_center(approach_dir):
+        print("Arrived at home (both sensors OPEN).")
+    else:
+        print("At reference, but both sensors not OPEN. Increase TWEAK_RANGE or adjust HOME_OFFSET_DIR.")
+
+
 
 def go_home():
     global step_count, rev_count, steps_till_rev, steps_since_rev, transition_sequence, step_delay
@@ -582,7 +798,7 @@ def go_home():
 
     #move the post-revs steps 
     #move_stepper(seq, steps_since_rev, step_delay, direction)
-    move_biased(steps_per_move=1, step_delay=step_delay, direction=direction)
+    move_biased(steps = 1, step_delay=step_delay, direction=direction)
 
     homing_steps = homing_steps+ steps_since_rev
     #print(f"Moving {abs(steps_since_rev)} steps in direction {direction}...")
@@ -597,7 +813,7 @@ def go_home():
         while True:
             if rev_count != (current_rev + (rev_diff * direction)):
                 #move_stepper(seq, 1, step_delay, direction)
-                move_biased(steps_per_move=1, step_delay=step_delay, direction=direction)
+                move_biased(steps =1, step_delay=step_delay, direction=direction)
                 homing_steps += 1
             else: 
                 break
@@ -610,7 +826,7 @@ def go_home():
 
     overshoot_steps = 20
     #move_stepper(seq, steps_till_rev+overshoot_steps, slower_delay, direction)
-    move_biased(steps_till_rev+overshoot_steps, step_delay=slower_delay, direction=direction)
+    move_biased(steps = steps_till_rev+overshoot_steps, step_delay=slower_delay, direction=direction)
     homing_steps = homing_steps + steps_till_rev + overshoot_steps
     print(f"Moving {abs(steps_till_rev + overshoot_steps)} steps in direction {direction} at slower speed...")
     
@@ -694,7 +910,8 @@ def home_menu():
 
         if choice == '1':
             print("Moving to home position...")
-            go_home()
+            #go_home()
+            go_home2()
             break
         elif choice == '2':
             confirm = input("Are you sure you want to reset home? This will re-set the monochromator. (y/N): ").strip().lower()
@@ -762,12 +979,12 @@ def main():
         if cmd in ('F','f'):
             print(f"Moving forward at {int(step_delay * 1000)} ms/step...")
             #move_stepper(seq, steps_per_move, step_delay, direction= 1)
-            move_biased(steps_per_move=1, step_delay=step_delay, direction=1)
+            move_biased(steps=1, step_delay=step_delay, direction=1)
             flush_input()
         elif cmd in ('R', 'r'):
             print(f"Moving reverse at {int(step_delay * 1000)} ms/step...")
             #move_stepper(seq, steps_per_move, step_delay, direction= -1)
-            move_biased(steps_per_move=1, step_delay=step_delay, direction=-1)
+            move_biased(steps=1, step_delay=step_delay, direction=-1)
             flush_input()
         elif cmd in ('J', 'j'):
             #jog_mode(step_delay)
