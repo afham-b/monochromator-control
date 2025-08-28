@@ -3,7 +3,13 @@ import time
 
 #if error with pyfirmata library, open the pyfirmata.py file in the library and replace getargspec with getfullargspec function calls
 
-board = Arduino('COM10')  # Change to your actual port
+#board = Arduino('COM10')  # Change to your actual port
+
+try:
+    board = Arduino('/dev/cu.usbmodem1101')
+except Exception as e:
+    print(f"Arduino initialization failed: {e}")
+    sys.exit(1)
 
 # Define pins
 IN1 = 11

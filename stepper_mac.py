@@ -2,6 +2,7 @@
 
 import os
 import logging
+import math
 from datetime import datetime
 
 from pyfirmata import Arduino, util 
@@ -84,15 +85,39 @@ home_pre_rev_steps =0
 #boolean to track home
 home = False
 
-# --- Homing config (tune as needed) ---
+#Edge-driven rev counting for optical switch 1, small disk
+rev_count = 0                # net revs from rising edges
+pre_rev_steps = 0            # signed: steps from zero to the FIRST rising edge seen after arming
+post_rev_steps = 0           # unsigned: steps since LAST rising edge
+_last_s1_open = None         # last boolean state of S1 (True=open, False=blocked)
+_first_rising_captured = False
+_last_rising_stepcount = 0   # step_count at last rising edge
+_steps_since_any_edge = 0    # edge holdoff counter to avoid double-trigger at boundary
+EDGE_HOLDOFF_STEPS = 3       # min steps between edges to consider another edge valid
+
+
+#Homing config
 HOME_OFFSET_DIR = {+1: 15, -1: 15}  # steps from S2 center toward the approach_dir to exact home
 FAST_STEP_DELAY   = 0.001
 EDGE_STEP_DELAY   = 0.004
 CENTER_STEP_DELAY = 0.006
 TWEAK_STEP_DELAY  = 0.008
 MAX_FIND_STEPS    = 20000       # hard cap so loops can't run forever
-TWEAK_RANGE       = 40           # +/- small steps to satisfy "both open"
+TWEAK_RANGE       = 60           # +/- small steps to satisfy "both open"
 FAR_STEP_THRESHOLD = 200   # steps to consider "far" for fast pre-roll
+
+# Grating geometry
+GRATING_D_MM = 1.0 / 1200.0   # groove spacing in mm for 1200 lines/mm
+
+# S2 rotation calibration storage
+S2_STEPS_PER_REV = 17971  # measured later; fallback computed if missing
+STEPS_PER_DEG = 51.8    # derived (S2_STEPS_PER_REV / 360)
+
+# Fallback (from your notes: 205 revs + 40 steps for one S2 360°)
+#   revs_per_rotation = motor-shaft revs (S1) per one S2 revolution
+#   steps_per_rev      = motor steps per one S1 revolution
+def _s2_steps_fallback():
+    return revs_per_rotation * steps_per_rev + delta_steps
 
 
 # Define your step sequence (half-step example)
@@ -110,6 +135,156 @@ seq = [
 
 step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
+
+def wavelength_to_theta_deg(lambda_nm, order_m, d_mm=GRATING_D_MM):
+    """
+    Uses your relation: m * λ = d * sin(theta)
+    λ enters in nm; convert to mm. Returns theta in degrees.
+    """
+    lam_mm = lambda_nm * 1e-6  # 1 nm = 1e-6 mm
+    #arg = (order_m * lam_mm) / d_mm.    # non littrow
+    arg = (order_m * lam_mm) / (2*d_mm)  # for Littrow
+    if abs(arg) > 1.0:
+        raise ValueError(f"Unreachable angle: |m*λ/d| = {arg:.6f} > 1")
+    theta_rad = math.asin(arg)
+    return math.degrees(theta_rad)
+
+def calibrate_s2_steps_per_rev(approach_dir=+1):
+    """
+    Index to S2 BLOCKED->OPEN edge, then count steps to see it again
+    in the same direction. Stores S2_STEPS_PER_REV and STEPS_PER_DEG.
+    """
+    global S2_STEPS_PER_REV, STEPS_PER_DEG
+
+    # 1) Land on B->O edge (direction-aware)
+    _step_until_state(optical_pin2, True,  approach_dir, EDGE_STEP_DELAY)   # ensure BLOCKED
+    _step_until_state(optical_pin2, False, approach_dir, EDGE_STEP_DELAY)   # first OPEN after BLOCKED
+
+    # 2) Count to the next identical edge (same direction)
+    steps = 0
+    # First leave OPEN (go to BLOCKED), so the next OPEN is our next cycle's edge
+    steps += _step_until_state(optical_pin2, True, approach_dir, EDGE_STEP_DELAY)
+    # Now count from BLOCKED to next OPEN
+    steps += _step_until_state(optical_pin2, False, approach_dir, EDGE_STEP_DELAY)
+
+    # 3) Save
+    S2_STEPS_PER_REV = steps
+    STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0
+    print(f"[Cal] S2_STEPS_PER_REV = {S2_STEPS_PER_REV}, STEPS_PER_DEG = {STEPS_PER_DEG:.6f}")
+    return S2_STEPS_PER_REV
+
+FAR_STEP_THRESHOLD_MOVE = 600   # if farther than this, sprint at FAST_STEP_DELAY
+
+def _ensure_steps_per_deg():
+    global S2_STEPS_PER_REV, STEPS_PER_DEG
+    if S2_STEPS_PER_REV is None:
+        # Use fallback if not calibrated yet
+        S2_STEPS_PER_REV = _s2_steps_fallback()
+        STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0
+        print(f"[Warn] Using fallback S2_STEPS_PER_REV={S2_STEPS_PER_REV} -> STEPS_PER_DEG={STEPS_PER_DEG:.6f}")
+
+def angle_to_steps(theta_deg):
+    _ensure_steps_per_deg()
+    direction = -1 #if CW is positive and 1 if CW is negative
+    steps = int(round(direction*theta_deg * STEPS_PER_DEG))
+    return steps
+
+def _stage_move_signed(delta_steps):
+    """
+    Signed move with a fast pre-roll when far, then slower finishing.
+    """
+    if delta_steps == 0:
+        return
+    direction = 1 if delta_steps > 0 else -1
+    remaining = abs(delta_steps)
+
+    # fast chunk
+    if remaining > FAR_STEP_THRESHOLD_MOVE:
+        fast_chunk = remaining - FAR_STEP_THRESHOLD_MOVE
+        move_biased(fast_chunk, FAST_STEP_DELAY, direction)
+        remaining -= fast_chunk
+
+    # finish at moderate speed
+    if remaining > 0:
+        move_biased(remaining, EDGE_STEP_DELAY, direction)
+
+def move_to_angle_deg(theta_deg, mode="from_home_ccw"):
+    """
+    mode:
+      - "from_home_ccw": go_home2() first, then move CCW (+ steps) to target.
+                         If target needs CW (negative steps), you can choose:
+                           (a) allow CW (faster) OR (b) wrap +360° (always CCW).
+                         Below I allow BOTH directions by default; if you want
+                         single-direction-only repeatability, set force_ccw=True.
+      - "shortest": move from current position in whichever direction is shorter.
+    """
+    # 1) target steps from HOME (m=0)
+    target_steps = angle_to_steps(theta_deg)
+
+    if mode == "from_home_ccw":
+        # Option A: always start from a repeatable reference
+        go_home2()
+
+        # change this flag to True if you want single-direction approach only:
+        force_ccw = False
+
+        if force_ccw and target_steps < 0:
+            # wrap to positive equivalent (adds one full turn)
+            _ensure_steps_per_deg()
+            target_steps = (target_steps % S2_STEPS_PER_REV)
+
+        _stage_move_signed(target_steps)
+
+        # tiny settle (take out micro-backlash)
+        move_biased(3, CENTER_STEP_DELAY, +1 if target_steps>=0 else -1)
+        move_biased(3, CENTER_STEP_DELAY, -1 if target_steps>=0 else +1)
+
+    elif mode == "shortest":
+        # Move from wherever we are now.
+        # We need current "from-home steps"; reuse your step_count (motor axis).
+        # If you prefer reference from S2, you can track a separate "s2_step_count".
+        current_steps_from_home = step_count  # using your convention (CW positive)
+        delta = target_steps - current_steps_from_home
+        # normalize delta to shortest path around a circle if a full 360 wrap is allowed
+        _ensure_steps_per_deg()
+        if abs(delta) > S2_STEPS_PER_REV / 2:
+            # take the shorter wrap path
+            if delta > 0:
+                delta -= S2_STEPS_PER_REV
+            else:
+                delta += S2_STEPS_PER_REV
+        _stage_move_signed(delta)
+
+    else:
+        raise ValueError("mode must be 'from_home_ccw' or 'shortest'")
+
+def move_to_wavelength(lambda_nm, order_m, mode="from_home_ccw"):
+    theta = wavelength_to_theta_deg(lambda_nm, order_m)
+    print(f"Target θ = {theta:.4f}° for λ={lambda_nm} nm, m={order_m}")
+    move_to_angle_deg(theta, mode=mode)
+
+def estimate_steps_from_S1():
+    """
+    Build a second estimate of total steps from S1 information.
+    Assumes you keep:
+      - rev_count (signed)
+      - steps_since_rev (signed, since last rising OPEN edge)
+      - pre_rev_steps (signed, from power-up/home to the first rising edge)
+    If you don’t trust pre_rev_steps, set it to 0 after home.
+    """
+    # You can store the sign convention: CCW positive (same as step_count)
+    # Here I mirror your sign usage.
+    return rev_count * steps_per_rev + steps_since_rev - pre_rev_steps
+
+def check_step_integrity(tolerance_steps=4):
+    est = estimate_steps_from_S1()
+    err = est - step_count
+    if abs(err) > tolerance_steps:
+        print(f"[Drift] S1-based est differs from step_count by {err} steps! Re-indexing recommended.")
+        return False, err
+    return True, err
+
+
 
 def move_biased(steps, step_delay, direction):
     # Apply direction-change backlash and steady-state reverse scaling.
@@ -226,7 +401,8 @@ def jog_mode(step_delay):
     global step_count, rev_count, home
 
     print("\n--- Jog Mode ---")
-    print("Hold UP for forward CCW, DOWN for reverse CW. Press Q to quit jog mode.")
+    print("Hold UP for forward CW, DOWN for reverse CCW. Press Q to quit jog mode.")
+    time.sleep(2)
     try:
         while True:
             if keyboard.is_pressed('q'):
@@ -459,6 +635,7 @@ def calibration():
             print('Resetting worm gear back home, stepping in reverse')
             time.sleep(5)
             move_stepper(seq, calibration_step_counter, step_delay=0.001, direction= -1)
+            print('Worm gear back home, Number of total steps: ', calibration_step_counter)
 
         elif choice == '3':
             print("Calibrating directional bias/backlash on small disk (sensor 1)...")
@@ -719,6 +896,21 @@ def find_window_edges(pin, direction, step_delay, max_steps=100000):
     width = steps_B - steps_A
     return width, steps_A, steps_B
 
+def _read_open_filtered(pin, retries=4, sleep_s=0.001, default=False):
+    """Return True if OPEN, False if BLOCKED. Debounce None->last-known. """
+    val = None
+    last = _last_s1_open if pin == optical_pin else default
+    for _ in range(retries):
+        v = board.digital[pin].read()
+        if v is not None:
+            val = not bool(v)   # pyfirmata: True means HIGH -> treats HIGH as BLOCKED
+            break
+        time.sleep(sleep_s)
+    if val is None:
+        return last if last is not None else default
+    return val
+
+
 
 #edge + step based homing function, as opposed to the only step based homing function gohome() 
 def go_home2():
@@ -732,8 +924,8 @@ def go_home2():
     """
     global step_count
 
-    # 0) Pick shortest approach: +steps => go CW (-1), -steps => go CCW (+1)
-    approach_dir = -1 if step_count >= 0 else +1
+    # 0) Pick shortest approach: +steps => go CW (1), -steps => go CCW (-1)
+    approach_dir = -1 if step_count >= 0 else 1 
 
     # 1) Fast pre-roll if far away (uses counters only to save time; sensor-indexing comes next)
     steps_far = abs(step_count)
@@ -926,6 +1118,132 @@ def home_menu():
         else:
             print("Invalid option. Please enter 1, 2, or Q.")
 
+def _ask_approach_mode():
+    while True:
+        m = input("Approach mode: [H] from home (repeatable) or [S] shortest path? ").strip().lower()
+        if m in ("h", "s"):
+            return "from_home_ccw" if m == "h" else "shortest"
+        print("Please enter H or S.")
+
+def position_menu():
+    while True:
+        print("\n--- Position Menu ---")
+        print("1) Calibrate S2 360° (steps/degree)")
+        print("2) Move to angle θ (degrees)")
+        print("3) Move to wavelength λ (nm) & order m")
+        print("4) Show current S2 steps/deg and integrity check")
+        print("Q) Back to main menu")
+
+        choice = input("Select: ").strip().lower()
+
+        if choice == "1":
+            dirch = input("Approach S2 edge in direction [+/-] (ENTER=+): ").strip()
+            approach_dir = -1 if dirch == "-" else +1
+            calibrate_s2_steps_per_rev(approach_dir=approach_dir)
+
+        elif choice == "2":
+            try:
+                theta = float(input("Enter target angle θ in degrees: ").strip())
+            except ValueError:
+                print("θ must be a number.")
+                continue
+            mode = _ask_approach_mode()
+            move_to_angle_deg(theta, mode=mode)
+            ok, err = check_step_integrity()
+            print(f"Integrity: {'OK' if ok else 'DRIFT'} (Δ={err} steps)  | step_count={step_count}")
+
+        elif choice == "3":
+            try:
+                lam = float(input("Enter wavelength λ in nm: ").strip())
+                m   = int(input("Enter diffraction order m (e.g., 0,1,2): ").strip())
+            except ValueError:
+                print("λ must be number, m must be integer.")
+                continue
+            mode = _ask_approach_mode()
+            try:
+                move_to_wavelength(lam, m, mode=mode)
+            except ValueError as e:
+                print(f"Error: {e}")
+                continue
+            ok, err = check_step_integrity()
+            print(f"Integrity: {'OK' if ok else 'DRIFT'} (Δ={err} steps)  | step_count={step_count}")
+
+        elif choice == "4":
+            _ensure_steps_per_deg()
+            print(f"S2_STEPS_PER_REV={S2_STEPS_PER_REV}, STEPS_PER_DEG={STEPS_PER_DEG:.6f}")
+            ok, err = check_step_integrity()
+            print(f"Integrity: {'OK' if ok else 'DRIFT'} (Δ={err} steps)  | step_count={step_count}")
+
+        elif choice in ("q", "Q"):
+            print("Leaving Position menu.")
+            return
+        else:
+            print("Invalid option.")
+
+def _stage_move_signed(delta_steps):
+    """
+    Signed move with a fast pre-roll when far, then slower finishing.
+    +delta => CW, -delta => CCW.
+    """
+    if delta_steps == 0:
+        return
+    direction = 1 if delta_steps > 0 else -1
+    remaining = abs(delta_steps)
+
+    print(f"[Stage] Moving {remaining} steps, dir={'CW' if direction>0 else 'CCW'}")
+
+    # fast chunk
+    if remaining > FAR_STEP_THRESHOLD_MOVE:
+        fast_chunk = remaining - FAR_STEP_THRESHOLD_MOVE
+        move_biased(fast_chunk, FAST_STEP_DELAY, direction)
+        remaining -= fast_chunk
+
+    # finish at moderate speed
+    if remaining > 0:
+        move_biased(remaining, EDGE_STEP_DELAY, direction)
+
+
+
+def goto_menu():
+    """
+    Repeatedly prompt for a signed step move.
+    +N => CW, -N => CCW (matches internal convention: direction=+1 is CW).
+    Type 'j' to jump to Jog, 'q' to quit back to main.
+    """
+    global step_delay  # for jog_mode2
+
+    print("\n--- GoTo (relative steps) ---")
+    print("Enter an integer step count:")
+    print("  +N = CW (forward)")
+    print("  -N = CCW (reverse)")
+    print("  j  = jump to Jog")
+    print("  q  = quit to main menu")
+
+    while True:
+        s = input("GoTo steps (+CW / -CCW, j, q): ").strip().lower()
+        if s == "q":
+            print("Leaving GoTo.")
+            return
+        if s == "j":
+            jog_mode2(step_delay)   # returns here when you quit Jog
+            continue
+
+        try:
+            user_steps = int(s)
+        except ValueError:
+            print("Please enter an integer (e.g., 120 or -350), or j, or q.")
+            continue
+
+        if user_steps == 0:
+            print("Zero steps — nothing to do.")
+            continue
+
+        # No sign flip: +N means CW (direction=+1), -N means CCW (direction=-1)
+        print(f"[GoTo] Request: {user_steps} steps "
+              f"({ 'CW' if user_steps>0 else 'CCW' })")
+        _stage_move_signed(user_steps)
+        print(f"Done. Current step_count = {step_count}")
+
 
 def wait_for_initial_sensor_states():
     global switch1, switch2
@@ -959,33 +1277,26 @@ def setup_logging():
 def main():
     global step_delay
 
-    wait_for_initial_sensor_states    
+    wait_for_initial_sensor_states()
 
     # Initialize logging
     log_file = setup_logging()
     logging.info(f"Starting stepper motor control - logging to {log_file}")
 
     print("Stepper Motor Control")
-    print("F: Forward CCW")
-    print("R: Reverse CW")
+    print("G: GoTo Step. +N Forward CW, -N Reverse CCW")
     print("J: Jog Mode (UP/DOWN arrows)")
     print("S: Speed Settings")
     print("H: Home Menu")
     print("C: Calibration")
+    print("P: Position Menu (Angle/Wavelength)")
     print("Q: Quit")
 
     while True:
-        cmd = input("Enter option Forward, Reverse, Jog, Speed Settings, Home, Calibration, Quit (F/R/J/S/H/C/Q): ").strip().upper()
-        if cmd in ('F','f'):
-            print(f"Moving forward at {int(step_delay * 1000)} ms/step...")
-            #move_stepper(seq, steps_per_move, step_delay, direction= 1)
-            move_biased(steps=1, step_delay=step_delay, direction=1)
-            flush_input()
-        elif cmd in ('R', 'r'):
-            print(f"Moving reverse at {int(step_delay * 1000)} ms/step...")
-            #move_stepper(seq, steps_per_move, step_delay, direction= -1)
-            move_biased(steps=1, step_delay=step_delay, direction=-1)
-            flush_input()
+        cmd = input("Enter option GoTo, Jog, Speed Settings, Home, Calibration, Position Menu, Quit (G/J/S/H/C/P/Q): ").strip().upper()
+        if cmd in ('G','g'):
+           goto_menu()
+           flush_input()
         elif cmd in ('J', 'j'):
             #jog_mode(step_delay)
             # for mac, jog2 function uses pynput instead of keyboard package
@@ -1000,13 +1311,21 @@ def main():
         elif cmd in ('C','c'):
             print("Starting Calibration")
             calibration()
+        elif cmd in ('P','p'):  
+            position_menu()
+            flush_input()
+
+            #move_to_wavelength(532, 1, mode="from_home_ccw")   # green, 1st order, repeatable approach
+            # or
+            #move_to_wavelength(650, 1, mode="shortest")        # quicker, chooses direction automatically
+            #move_to_angle_deg(12.5, mode="from_home_ccw").     #going to 12.5 degrees, counterclockwise from home
 
         elif cmd in ('q', 'Q'):
             print("Quitting.")
             flush_input()
             break
         else:
-            print("Invalid option. Enter F, R, J, S, H, C, or Q.")
+            print("Invalid option. Enter G, J, S, H, C, P, or Q.")
             flush_input()
     for pin in pins:
         board.digital[pin].write(0)
