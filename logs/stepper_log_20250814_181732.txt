@@ -1,1 +1,0 @@
-2025-08-14 18:17:32,880 - Starting stepper motor control - logging to logs/stepper_log_20250814_181732.txt

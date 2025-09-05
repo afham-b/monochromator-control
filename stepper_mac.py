@@ -93,7 +93,7 @@ _last_s1_open = None         # last boolean state of S1 (True=open, False=blocke
 _first_rising_captured = False
 _last_rising_stepcount = 0   # step_count at last rising edge
 _steps_since_any_edge = 0    # edge holdoff counter to avoid double-trigger at boundary
-EDGE_HOLDOFF_STEPS = 3       # min steps between edges to consider another edge valid
+EDGE_HOLDOFF_STEPS = 6       # min steps between edges to consider another edge valid
 
 
 #Homing config
@@ -106,18 +106,26 @@ MAX_FIND_STEPS    = 20000       # hard cap so loops can't run forever
 TWEAK_RANGE       = 60           # +/- small steps to satisfy "both open"
 FAR_STEP_THRESHOLD = 200   # steps to consider "far" for fast pre-roll
 
+# --- Logging & persistence paths ---
+LOG_DIR   = "logs"
+LOG_FILE  = os.path.join(LOG_DIR, "stepper.log")  # single, ever-growing log
+STATE_DIR = "state"
+STEP_FILE = os.path.join(STATE_DIR, "step_count.txt")  # holds only the step_count number
+
+
 # Grating geometry
 GRATING_D_MM = 1.0 / 1200.0   # groove spacing in mm for 1200 lines/mm
 
 # S2 rotation calibration storage
 S2_STEPS_PER_REV = 17971  # measured later; fallback computed if missing
-STEPS_PER_DEG = 51.8    # derived (S2_STEPS_PER_REV / 360)
+STEPS_PER_DEG = None    # derived (S2_STEPS_PER_REV / 360)
 
 # Fallback (from your notes: 205 revs + 40 steps for one S2 360°)
 #   revs_per_rotation = motor-shaft revs (S1) per one S2 revolution
 #   steps_per_rev      = motor steps per one S1 revolution
 def _s2_steps_fallback():
     return revs_per_rotation * steps_per_rev + delta_steps
+
 
 
 # Define your step sequence (half-step example)
@@ -373,6 +381,9 @@ def move_stepper(seq, steps,step_delay, direction):
     # Turn all pins off when done
     for pin in pins:
         board.digital[pin].write(0)
+
+    # persist current position to disk
+    _persist_step_count()
 
     #for testing    
     print("step count", step_count)
@@ -922,7 +933,7 @@ def go_home2():
       3) Apply per-direction home offset to reproduce your calibrated 'both-open' home.
       4) Micro-tweak a few steps to satisfy both sensors OPEN (bounded, no runaway).
     """
-    global step_count
+    global step_count, rev_count
 
     # 0) Pick shortest approach: +steps => go CW (1), -steps => go CCW (-1)
     approach_dir = -1 if step_count >= 0 else 1 
@@ -960,9 +971,13 @@ def go_home2():
     # 5) Ensure both sensors OPEN (bounded micro-tweak, no infinite while)
     if _micro_tweak_around_center(approach_dir):
         print("Arrived at home (both sensors OPEN).")
+        rev_count = 0
     else:
         print("At reference, but both sensors not OPEN. Increase TWEAK_RANGE or adjust HOME_OFFSET_DIR.")
-
+    
+    # persist current position to disk
+    _persist_step_count()
+  
 
 
 def go_home():
@@ -1089,6 +1104,9 @@ def set_home():
     rev_count = 0   # Reset revolution count
     steps_since_rev = 0
     steps_till_rev = 0
+
+    # persist current position to disk
+    _persist_step_count()
     
     print('Total Steps, total revs, delta steps pre-rev, delta steps post-revs:', home_steps, ' ,' ,home_revs, ' ,',home_pre_rev_steps, ' ,',home_delta_steps )
 
@@ -1253,25 +1271,47 @@ def wait_for_initial_sensor_states():
         time.sleep(0.01)  # Wait briefly
 
 def setup_logging():
-    # Create logs directory if it doesn't exist
-    log_dir = "logs"
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    
-    # Create timestamp for filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"logs/stepper_log_{timestamp}.txt"
-    
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_filename),
-            logging.StreamHandler()
-        ]
-    )
-    return log_filename
+    os.makedirs(LOG_DIR, exist_ok=True)
+    # Reset root logger to avoid duplicate handlers after restarts
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter('%(asctime)s - %(message)s')
+
+    fh = logging.FileHandler(LOG_FILE, mode='a')   # append to one file
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    logging.info(f"Logging to {LOG_FILE}")
+    return LOG_FILE
+
+def _persist_step_count():
+    """Atomically write current step_count to STEP_FILE."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STEP_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(step_count))
+    os.replace(tmp, STEP_FILE)  # atomic on POSIX/macOS/Windows NTFS
+
+def _load_persisted_step_count():
+    """Initialize step_count from STEP_FILE if present."""
+    global step_count
+    try:
+        with open(STEP_FILE, "r") as f:
+            txt = f.read().strip()
+            step_count = int(txt)
+            print(f"[Persist] Restored step_count={step_count} from {STEP_FILE}")
+    except FileNotFoundError:
+        print("[Persist] No previous step_count; starting at 0")
+        step_count = 0
+    except Exception as e:
+        print(f"[Persist] Could not read {STEP_FILE} ({e}); starting at 0")
+        step_count = 0
 
 
 def main():
@@ -1279,9 +1319,13 @@ def main():
 
     wait_for_initial_sensor_states()
 
-    # Initialize logging
+    # Logging first (so restore message is logged to console/file)
     log_file = setup_logging()
-    logging.info(f"Starting stepper motor control - logging to {log_file}")
+
+    # Restore last position (if any)
+    _load_persisted_step_count()
+
+    logging.info("Starting stepper motor control")
 
     print("Stepper Motor Control")
     print("G: GoTo Step. +N Forward CW, -N Reverse CCW")
