@@ -74,7 +74,7 @@ transition_sequence = []
 # determined by calibration
 steps_per_rev = 100
 # it takes 205 revs + 40 steps for one full gear rotations.
-revs_per_rotation = 205 
+revs_per_rotation = 180 
 delta_steps = 40
 
 #use these variable to set a home. 
@@ -112,20 +112,22 @@ LOG_FILE  = os.path.join(LOG_DIR, "stepper.log")  # single, ever-growing log
 STATE_DIR = "state"
 STEP_FILE = os.path.join(STATE_DIR, "step_count.txt")  # holds only the step_count number
 
+#optical-home offset persistence
+OPTICAL_OFFSET_FILE = os.path.join(STATE_DIR, "optical_home_offset.txt")
+OPTICAL_HOME_OFFSET_STEPS = 0  # +CW, -CCW (relative to Disk Home)
 
 # Grating geometry
 GRATING_D_MM = 1.0 / 1200.0   # groove spacing in mm for 1200 lines/mm
 
 # S2 rotation calibration storage
 S2_STEPS_PER_REV = 17971  # measured later; fallback computed if missing
-STEPS_PER_DEG = None    # derived (S2_STEPS_PER_REV / 360)
+STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0     # derived (S2_STEPS_PER_REV / 360)
 
 # Fallback (from your notes: 205 revs + 40 steps for one S2 360°)
 #   revs_per_rotation = motor-shaft revs (S1) per one S2 revolution
 #   steps_per_rev      = motor steps per one S1 revolution
 def _s2_steps_fallback():
     return revs_per_rotation * steps_per_rev + delta_steps
-
 
 
 # Define your step sequence (half-step example)
@@ -374,6 +376,9 @@ def move_stepper(seq, steps,step_delay, direction):
         step_count += 1*direction  # After one complete seq, count as one step
 
         steps_since_rev += 1*direction
+
+        #add persistence per step, remove if run time increases too much 
+        _persist_step_count()
 
         if is_1rev_completed == False and state1 == "BLOCKED":
             steps_till_rev += 1 *direction
@@ -804,16 +809,22 @@ def _find_B2O_and_measure_open(pin, direction, first_fast=True):
         raise RuntimeError("Open window width measured as 0")
     return width
 
-def _center_on_open_window(pin, approach_dir):
+def _center_on_open_window(pin, approach_dir, first_fast=True):
     """
     Centers the sensor on the OPEN window using the chosen approach_dir.
     We land at the far (OPEN->BLOCKED) edge and reverse by half width.
     Backlash is handled by move_biased().
     """
-    w = _find_B2O_and_measure_open(pin, direction=approach_dir, first_fast=True)
+
+    global EDGE_HOLDOFF_STEPS
+
+    w = _find_B2O_and_measure_open(pin, direction=approach_dir, first_fast=first_fast)
+    EDGE_HOLDOFF_STEPS = max(3, int(0.10 * w))
     half = max(1, w // 2)
+    
     move_biased(half, CENTER_STEP_DELAY, -approach_dir)  # reverse half to center
     return w
+
 
 def _both_open():
     return (not _read_blocked(optical_pin2)) and (not _read_blocked(optical_pin))
@@ -921,63 +932,177 @@ def _read_open_filtered(pin, retries=4, sleep_s=0.001, default=False):
         return last if last is not None else default
     return val
 
+def _zero_s1_counters():
+    global rev_count, steps_since_rev, steps_till_rev, pre_rev_steps, post_rev_steps
+    global is_1rev_completed, transition_sequence, last_switch1_state
+    rev_count = 0
+    steps_since_rev = 0
+    steps_till_rev = 0
+    pre_rev_steps = 0
+    post_rev_steps = 0
+    is_1rev_completed = False
+    transition_sequence = ["OPEN"]
+    last_switch1_state = None
 
 
 #edge + step based homing function, as opposed to the only step based homing function gohome() 
 def go_home2():
     """
-    Shortest-path homing:
-      1) Choose approach_dir from signed step_count (short way back).
-      2) On switch 2, approach BLOCKED->OPEN edge in that direction,
-         measure OPEN width, reverse half to center (backlash compensated).
-      3) Apply per-direction home offset to reproduce your calibrated 'both-open' home.
-      4) Micro-tweak a few steps to satisfy both sensors OPEN (bounded, no runaway).
+    Rehome with awareness of current sensor state.
+
+    If S2 is already OPEN (likely already at/near home), do a *slow* edge capture
+    based on the signed step_count (leave OPEN -> hit BLOCKED, then capture the
+    next BLOCKED->OPEN edge), then center and micro-tweak.
+
+    Otherwise (S2 not open), keep the existing fast-pre-roll + index/center.
     """
-    global step_count, rev_count
+    global step_count
 
-    # 0) Pick shortest approach: +steps => go CW (1), -steps => go CCW (-1)
-    approach_dir = -1 if step_count >= 0 else 1 
+    # Pick a direction from the sign of step_count (your convention: + => CW, - => CCW)
+    if step_count > 0:
+        approach_dir = -1
+    elif step_count < 0:
+        approach_dir = 1
+    else:
+        approach_dir = +1  # arbitrary default when zero
 
-    # 1) Fast pre-roll if far away (uses counters only to save time; sensor-indexing comes next)
-    steps_far = abs(step_count)
-    if steps_far > FAR_STEP_THRESHOLD:
-        fast_steps = steps_far - FAR_STEP_THRESHOLD
-        move_biased(fast_steps, FAST_STEP_DELAY, approach_dir)
+    s2_is_open = not _read_blocked(optical_pin2)
 
-    # 2) Index & center on S2 OPEN window (direction-aware; uses sensors only)
-    try:
-        open_w = _center_on_open_window(optical_pin2, approach_dir)
-        print(f"S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
-    except RuntimeError as e:
-        print(f"[Homing] S2 centering failed: {e}")
-        return
+    if s2_is_open:
+        # --- Rehoming while already in S2's OPEN window ---
+        # 1) Leave OPEN to BLOCKED (slow)
+        _step_until_state(optical_pin2, True,  approach_dir, EDGE_STEP_DELAY)
+        # 2) Now capture the BLOCKED->OPEN rising edge (slow)
+        _step_until_state(optical_pin2, False, approach_dir, EDGE_STEP_DELAY)
+        # 3) Center on the window (do NOT use a fast first pass)
+        try:
+            open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=False)
+            print(f"[Rehome] S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
+        except RuntimeError as e:
+            print(f"[Rehome] S2 centering failed: {e}")
+            return
+    else:
+        # --- Normal approach: optionally fast pre-roll, then index/center ---
+        steps_far = abs(step_count)
+        if steps_far > FAR_STEP_THRESHOLD:
+            fast_steps = steps_far - FAR_STEP_THRESHOLD
+            move_biased(fast_steps, FAST_STEP_DELAY, approach_dir)
 
-    # 3) Apply small per-direction offset from S2 center to your true home
+        try:
+            open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=True)
+            print(f"S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
+        except RuntimeError as e:
+            print(f"[Homing] S2 centering failed: {e}")
+            return
+
+    # Apply your calibrated small offset (directional) from S2 center to true home
     off = int(HOME_OFFSET_DIR.get(approach_dir, 0))
     if off:
         move_biased(off, CENTER_STEP_DELAY, approach_dir)
 
-    # 4) Optional light hysteresis settle: overshoot a tiny bit and return
-    # (kept small so it never runs long)
-    move_biased(3, CENTER_STEP_DELAY, approach_dir)
-    move_biased(3, CENTER_STEP_DELAY, -approach_dir)
+    # Light settle
+    #move_biased(3, CENTER_STEP_DELAY, approach_dir)
+    #move_biased(3, CENTER_STEP_DELAY, -approach_dir)
 
-    # Uncomment if you want to bias using a static offset number of steps that are known
-    # if approach_dir == 1:
-    #     move_biased(8, EDGE_STEP_DELAY, 1)
-    # else:
-    #     move_biased(2, EDGE_STEP_DELAY, -1)
-
-    # 5) Ensure both sensors OPEN (bounded micro-tweak, no infinite while)
+    # Ensure both sensors OPEN with bounded micro-tweak
     if _micro_tweak_around_center(approach_dir):
         print("Arrived at home (both sensors OPEN).")
-        rev_count = 0
     else:
         print("At reference, but both sensors not OPEN. Increase TWEAK_RANGE or adjust HOME_OFFSET_DIR.")
-    
-    # persist current position to disk
-    _persist_step_count()
-  
+
+    # Zero counters and persist now that we have a fresh, indexed home
+    _zero_s1_counters()
+    step_count = 0
+    try:
+        _persist_step_count()
+    except NameError:
+        print("Step count persistence not implemented. Check File issue.")  # during early testing
+        pass
+
+def go_optical_home():
+    """
+    Go to Disk Home (repeatable, via sensors), then apply the saved optical-home offset.
+    """
+    global OPTICAL_HOME_OFFSET_STEPS
+    go_home2()  # zeros step_count at Disk Home
+    if OPTICAL_HOME_OFFSET_STEPS != 0:
+        _stage_move_signed(OPTICAL_HOME_OFFSET_STEPS)
+    print(f"[OpticalHome] At optical home (offset {OPTICAL_HOME_OFFSET_STEPS} steps from disk home).")
+
+def find_optical_home_offset():
+    """
+    Guide: go to Disk Home, then step the stage until the user says they're at optical home.
+    Controls:
+      ↑  : +1 step (CW)
+      ↓  : -1 step (CCW)
+      PgUp / PgDn : ±10 steps
+      r  : reset this session's offset to 0 (return to Disk Home)
+      Enter or s : save offset and exit
+      q or Esc   : cancel without saving
+    """
+    global OPTICAL_HOME_OFFSET_STEPS
+
+    # 1) Start from a clean Disk Home
+    go_home2()
+
+    # Live session offset we’re editing (don’t overwrite saved value until user saves)
+    session_offset = 0
+    running = True
+
+    print("\n--- Set Optical Home Offset ---")
+    print("Use ↑/↓ to nudge (PgUp/PgDn = ±10). Press Enter or 's' to save, 'r' to reset, 'q'/Esc to cancel.")
+
+    # We use pynput's keyboard.Listener (already imported as 'keyboard' in your file)
+    def _nudge(n):
+        nonlocal session_offset
+        if n == 0:
+            return
+        direction = 1 if n > 0 else -1
+        move_biased(abs(n), TWEAK_STEP_DELAY, direction)
+        session_offset += n
+        print(f"[Offset] session = {session_offset} steps (saved = {OPTICAL_HOME_OFFSET_STEPS})")
+
+    def on_press(key):
+        nonlocal running, session_offset
+        try:
+            if key == keyboard.Key.up:
+                _nudge(+1)
+            elif key == keyboard.Key.down:
+                _nudge(-1)
+            elif key == keyboard.Key.page_up:
+                _nudge(+10)
+            elif key == keyboard.Key.page_down:
+                _nudge(-10)
+            elif key == keyboard.Key.enter or (hasattr(key, "char") and key.char and key.char.lower() == 's'):
+                # Save & exit
+                OPTICAL_HOME_OFFSET_STEPS = session_offset
+                _persist_optical_offset()
+                print(f"[Saved] Optical-home offset set to {OPTICAL_HOME_OFFSET_STEPS} steps.")
+                running = False
+                return False
+            elif key == keyboard.Key.esc or (hasattr(key, "char") and key.char and key.char.lower() == 'q'):
+                print("[Cancel] Leaving offset unchanged.")
+                running = False
+                return False
+            elif hasattr(key, "char") and key.char and key.char.lower() == 'r':
+                # Return to Disk Home within this session
+                if session_offset != 0:
+                    _nudge(-session_offset)  # back to zero
+                    print("[Reset] Session offset reset to 0 (Disk Home).")
+        except Exception as e:
+            print(f"[Listener] {e}")
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+
+    try:
+        while running:
+            monitor_sensors()
+            time.sleep(0.05)
+    finally:
+        listener.stop()
+    print("Done setting optical-home offset.")
+
 
 
 def go_home():
@@ -1113,35 +1238,44 @@ def set_home():
 def home_menu():
     while True:
         print("\n--- Home Menu ---")
-        print("1: Go to Home")
-        print("2: Reset Home")
+        print("1: Go to Disk Home")
+        print("2: Reset Disk Home (redefine Disk Home)")
+        print("3: Set Optical Home Offset (interactive)")
+        print("4: Go to Optical Home (Disk Home + saved offset)")
         print("Q: Return to main menu")
-        choice = input("Choose an option (1/2/Q): ").strip().lower()
+        choice = input("Choose an option (1/2/3/4/Q): ").strip().lower()
 
         if choice == '1':
-            print("Moving to home position...")
-            #go_home()
+            print("Moving to Disk Home...")
             go_home2()
             break
+
         elif choice == '2':
-            confirm = input("Are you sure you want to reset home? This will re-set the monochromator. (y/N): ").strip().lower()
-            if confirm == 'y':
+            try:
+                confirm = _prompt_or_quit("Are you sure you want to reset Disk Home? (y = yes, q=quit): ")
+            except _QuitToMain:
+                print("Exiting home menu.")
+                break
+            if confirm.strip().lower() == 'y':
                 set_home()
                 break
             else:
                 print("Reset cancelled. Returning to home menu.")
+
+        elif choice == '3':
+            find_optical_home_offset()
+            # stay in menu to allow immediate '4' if desired
+
+        elif choice == '4':
+            go_optical_home()
+            break
+
         elif choice == 'q':
             print("Exiting home menu.")
             break
         else:
-            print("Invalid option. Please enter 1, 2, or Q.")
+            print("Invalid option. Please enter 1, 2, 3, 4, or Q.")
 
-def _ask_approach_mode():
-    while True:
-        m = input("Approach mode: [H] from home (repeatable) or [S] shortest path? ").strip().lower()
-        if m in ("h", "s"):
-            return "from_home_ccw" if m == "h" else "shortest"
-        print("Please enter H or S.")
 
 def position_menu():
     while True:
@@ -1161,23 +1295,34 @@ def position_menu():
 
         elif choice == "2":
             try:
-                theta = float(input("Enter target angle θ in degrees: ").strip())
+                theta_s = _prompt_or_quit("Enter target angle θ in degrees (q=quit): ")
+                theta = float(theta_s)
+                mode = _ask_approach_mode()   # may raise _QuitToMain
+            except _QuitToMain:
+                print("Leaving Position menu.")
+                return
             except ValueError:
                 print("θ must be a number.")
                 continue
-            mode = _ask_approach_mode()
+
             move_to_angle_deg(theta, mode=mode)
             ok, err = check_step_integrity()
             print(f"Integrity: {'OK' if ok else 'DRIFT'} (Δ={err} steps)  | step_count={step_count}")
 
         elif choice == "3":
             try:
-                lam = float(input("Enter wavelength λ in nm: ").strip())
-                m   = int(input("Enter diffraction order m (e.g., 0,1,2): ").strip())
+                lam_s = _prompt_or_quit("Enter wavelength λ in nm (q=quit): ")
+                lam = float(lam_s)
+                m_s   = _prompt_or_quit("Enter diffraction order m (integer) (q=quit): ")
+                m   = int(m_s)
+                mode = _ask_approach_mode()   # may raise _QuitToMain
+            except _QuitToMain:
+                print("Leaving Position menu.")
+                return
             except ValueError:
                 print("λ must be number, m must be integer.")
                 continue
-            mode = _ask_approach_mode()
+
             try:
                 move_to_wavelength(lam, m, mode=mode)
             except ValueError as e:
@@ -1219,6 +1364,57 @@ def _stage_move_signed(delta_steps):
     # finish at moderate speed
     if remaining > 0:
         move_biased(remaining, EDGE_STEP_DELAY, direction)
+
+# --- Quick quit-from-any-prompt plumbing ---
+class _QuitToMain(Exception):
+    pass
+
+def _prompt_or_quit(prompt: str) -> str:
+    """
+    Read a line; if the user typed 'q' (any case), throw _QuitToMain to unwind back to main menu.
+    """
+    s = input(prompt).strip()
+    if s.lower() == 'q':
+        raise _QuitToMain
+    return s
+
+# If True: when user chooses "Home-first" while already in S2 OPEN window, auto-switch to 'shortest' (no rehome).
+# If False: do gentle rehome-in-window using go_home2() (recommended, repeatable).
+AUTO_SHORT_WHEN_AT_HOME = True
+
+def _ask_approach_mode():
+    """
+    Returns either 'from_home_ccw' (home-first) or 'shortest'.
+    'q' at any time returns to main menu.
+    If already within S2 OPEN window and user picks Home-first:
+      - Either auto-switch to shortest (if AUTO_SHORT_WHEN_AT_HOME=True), or
+      - Keep 'from_home_ccw' and rely on go_home2(), which will do a gentle rehome-in-window.
+    """
+    while True:
+        try:
+            m = _prompt_or_quit("Approach mode: [H] from home (repeatable) or [S] shortest path? (q=quit) ")
+        except _QuitToMain:
+            # bubble out to caller; caller should catch and return to main menu
+            raise
+
+        m = m.strip().lower()
+        if m in ("h", "s"):
+            # If they chose Home-first but we're already in S2 OPEN, decide behavior.
+            if m == "h":
+                s2_is_open = (not _read_blocked(optical_pin2))
+                if s2_is_open:
+                    if AUTO_SHORT_WHEN_AT_HOME:
+                        print("[Info] Already in S2 OPEN window → using shortest path instead of rehoming.")
+                        return "shortest"
+                    else:
+                        print("[Info] Already in S2 OPEN window → will do a gentle rehome-in-window.")
+                        return "from_home_ccw"
+                # not open → normal home-first
+                return "from_home_ccw"
+            else:
+                return "shortest"
+
+        print("Please enter H, S, or q.")
 
 
 
@@ -1313,6 +1509,27 @@ def _load_persisted_step_count():
         print(f"[Persist] Could not read {STEP_FILE} ({e}); starting at 0")
         step_count = 0
 
+def _persist_optical_offset():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = OPTICAL_OFFSET_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(OPTICAL_HOME_OFFSET_STEPS))
+    os.replace(tmp, OPTICAL_OFFSET_FILE)
+
+def _load_optical_offset():
+    global OPTICAL_HOME_OFFSET_STEPS
+    try:
+        with open(OPTICAL_OFFSET_FILE, "r") as f:
+            OPTICAL_HOME_OFFSET_STEPS = int(f.read().strip())
+            print(f"[Persist] Optical-home offset = {OPTICAL_HOME_OFFSET_STEPS} steps (from {OPTICAL_OFFSET_FILE})")
+    except FileNotFoundError:
+        print("[Persist] No optical-home offset file; defaulting to 0")
+        OPTICAL_HOME_OFFSET_STEPS = 0
+    except Exception as e:
+        print(f"[Persist] Could not read {OPTICAL_OFFSET_FILE} ({e}); defaulting to 0")
+        OPTICAL_HOME_OFFSET_STEPS = 0
+
+
 
 def main():
     global step_delay
@@ -1324,6 +1541,9 @@ def main():
 
     # Restore last position (if any)
     _load_persisted_step_count()
+
+    # NEW: restore optical-home offset
+    _load_optical_offset()
 
     logging.info("Starting stepper motor control")
 
