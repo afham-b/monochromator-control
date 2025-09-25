@@ -105,6 +105,7 @@ TWEAK_STEP_DELAY  = 0.008
 MAX_FIND_STEPS    = 20000       # hard cap so loops can't run forever
 TWEAK_RANGE       = 60           # +/- small steps to satisfy "both open"
 FAR_STEP_THRESHOLD = 200   # steps to consider "far" for fast pre-roll
+REHOME_BUMP_STEPS  = 100   # how far to leave the OPEN window when already at home
 
 # --- Logging & persistence paths ---
 LOG_DIR   = "logs"
@@ -700,21 +701,6 @@ def jog_mode2(step_delay):
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
 
-    #orginal running loop, testing other loops for responsiveness
-    # while running:
-    #     if forward_pressed:
-    #         move_stepper(seq, steps =1, step_delay =0.001, direction= 1)
-    #         #for testing    
-    #         print("step count", step_count)
-    #         print("rev count", rev_count)
-    #     if reverse_pressed:
-    #         move_stepper(seq, steps=1, step_delay =0.001, direction= -1)
-    #         #for testing    
-    #         print("step count", step_count)
-    #         print("rev count", rev_count)
-    #     monitor_sensors()
-    #     time.sleep(0.001)  # Adjust for responsiveness/smoothness
-
     while running:
         step_delay = 0.001  # Set a fixed step delay for responsiveness
         if forward_pressed:
@@ -946,15 +932,88 @@ def _zero_s1_counters():
 
 
 #edge + step based homing function, as opposed to the only step based homing function gohome() 
+# def go_home2():
+#     """
+#     Rehome with awareness of current sensor state.
+
+#     If S2 is already OPEN (likely already at/near home), do a *slow* edge capture
+#     based on the signed step_count (leave OPEN -> hit BLOCKED, then capture the
+#     next BLOCKED->OPEN edge), then center and micro-tweak.
+
+#     Otherwise (S2 not open), keep the existing fast-pre-roll + index/center.
+#     """
+#     global step_count
+
+#     # Pick a direction from the sign of step_count (your convention: + => CW, - => CCW)
+#     if step_count > 0:
+#         approach_dir = -1
+#     elif step_count < 0:
+#         approach_dir = 1
+#     else:
+#         approach_dir = +1  # arbitrary default when zero
+
+#     s2_is_open = not _read_blocked(optical_pin2)
+
+#     if s2_is_open:
+#         # --- Rehoming while already in S2's OPEN window ---
+#         # 1) Leave OPEN to BLOCKED (slow)
+#         _step_until_state(optical_pin2, True,  approach_dir, EDGE_STEP_DELAY)
+#         # 2) Now capture the BLOCKED->OPEN rising edge (slow)
+#         _step_until_state(optical_pin2, False, approach_dir, EDGE_STEP_DELAY)
+#         # 3) Center on the window (do NOT use a fast first pass)
+#         try:
+#             open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=False)
+#             print(f"[Rehome] S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
+#         except RuntimeError as e:
+#             print(f"[Rehome] S2 centering failed: {e}")
+#             return
+#     else:
+#         # --- Normal approach: optionally fast pre-roll, then index/center ---
+#         steps_far = abs(step_count)
+#         if steps_far > FAR_STEP_THRESHOLD:
+#             fast_steps = steps_far - FAR_STEP_THRESHOLD
+#             move_biased(fast_steps, FAST_STEP_DELAY, approach_dir)
+
+#         try:
+#             open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=True)
+#             print(f"S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
+#         except RuntimeError as e:
+#             print(f"[Homing] S2 centering failed: {e}")
+#             return
+
+#     # Apply your calibrated small offset (directional) from S2 center to true home
+#     off = int(HOME_OFFSET_DIR.get(approach_dir, 0))
+#     if off:
+#         move_biased(off, CENTER_STEP_DELAY, approach_dir)
+
+#     # Light settle
+#     #move_biased(3, CENTER_STEP_DELAY, approach_dir)
+#     #move_biased(3, CENTER_STEP_DELAY, -approach_dir)
+
+#     # Ensure both sensors OPEN with bounded micro-tweak
+#     if _micro_tweak_around_center(approach_dir):
+#         print("Arrived at home (both sensors OPEN).")
+#     else:
+#         print("At reference, but both sensors not OPEN. Increase TWEAK_RANGE or adjust HOME_OFFSET_DIR.")
+
+#     # Zero counters and persist now that we have a fresh, indexed home
+#     _zero_s1_counters()
+#     step_count = 0
+#     try:
+#         _persist_step_count()
+#     except NameError:
+#         print("Step count persistence not implemented. Check File issue.")  # during early testing
+#         pass
+
+
 def go_home2():
     """
     Rehome with awareness of current sensor state.
 
-    If S2 is already OPEN (likely already at/near home), do a *slow* edge capture
-    based on the signed step_count (leave OPEN -> hit BLOCKED, then capture the
-    next BLOCKED->OPEN edge), then center and micro-tweak.
+    If S2 is already OPEN (likely already near home), do a single-pass centering
+    using the preferred approach direction, slow and bounded.
 
-    Otherwise (S2 not open), keep the existing fast-pre-roll + index/center.
+    Otherwise (S2 not OPEN), do the normal fast pre-roll, then edge index & center.
     """
     global step_count
 
@@ -968,56 +1027,62 @@ def go_home2():
 
     s2_is_open = not _read_blocked(optical_pin2)
 
-    if s2_is_open:
-        # --- Rehoming while already in S2's OPEN window ---
-        # 1) Leave OPEN to BLOCKED (slow)
-        _step_until_state(optical_pin2, True,  approach_dir, EDGE_STEP_DELAY)
-        # 2) Now capture the BLOCKED->OPEN rising edge (slow)
-        _step_until_state(optical_pin2, False, approach_dir, EDGE_STEP_DELAY)
-        # 3) Center on the window (do NOT use a fast first pass)
-        try:
-            open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=False)
-            print(f"[Rehome] S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
-        except RuntimeError as e:
-            print(f"[Rehome] S2 centering failed: {e}")
-            return
-    else:
-        # --- Normal approach: optionally fast pre-roll, then index/center ---
-        steps_far = abs(step_count)
-        if steps_far > FAR_STEP_THRESHOLD:
-            fast_steps = steps_far - FAR_STEP_THRESHOLD
-            move_biased(fast_steps, FAST_STEP_DELAY, approach_dir)
+    REHOME_BUMP_DIR = approach_dir  # small bump to leave OPEN if needed
+    PREFERRED_HOME_APPROACH_DIR = -approach_dir  # main centering direction
 
-        try:
-            open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=True)
-            print(f"S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
-        except RuntimeError as e:
-            print(f"[Homing] S2 centering failed: {e}")
-            return
+    try:
+        if s2_is_open:
+            # 1) leave OPEN by a tiny, known bump
+            move_biased(REHOME_BUMP_STEPS, EDGE_STEP_DELAY, REHOME_BUMP_DIR)
+            # ensure we actually are on BLOCKED side now (no-ops if already blocked)
+            _step_until_state(optical_pin2, True,  REHOME_BUMP_DIR, EDGE_STEP_DELAY)
 
-    # Apply your calibrated small offset (directional) from S2 center to true home
-    off = int(HOME_OFFSET_DIR.get(approach_dir, 0))
+            # 2) ONE centering pass (slow) in preferred direction
+            open_w = _center_on_open_window(optical_pin2,
+                                            PREFERRED_HOME_APPROACH_DIR,
+                                            first_fast=False)
+            print(f"[Rehome@Open] S2 centered. OPEN width ≈ {open_w} steps "
+                  f"(dir {PREFERRED_HOME_APPROACH_DIR}).")
+
+        else:
+            # Optional sprint toward home just to reduce time (does not set direction)
+            steps_far = abs(step_count)
+            if steps_far > FAR_STEP_THRESHOLD:
+                fast_chunk_dir = +1 if step_count > 0 else -1
+                move_biased(steps_far - FAR_STEP_THRESHOLD, FAST_STEP_DELAY, fast_chunk_dir)
+
+            # ONE centering pass (fast allowed) in preferred direction
+            open_w = _center_on_open_window(optical_pin2,
+                                            PREFERRED_HOME_APPROACH_DIR,
+                                            first_fast=True)
+            print(f"[Rehome] S2 centered. OPEN width ≈ {open_w} steps "
+                  f"(dir {PREFERRED_HOME_APPROACH_DIR}).")
+
+    except RuntimeError as e:
+        # Safety fallback: try the opposite approach direction once
+        alt_dir = -PREFERRED_HOME_APPROACH_DIR
+        print(f"[Rehome] Centering failed in dir {PREFERRED_HOME_APPROACH_DIR}: {e}. "
+              f"Retrying in dir {alt_dir}.")
+        open_w = _center_on_open_window(optical_pin2, alt_dir, first_fast=False)
+        print(f"[Rehome] Retry succeeded. OPEN width ≈ {open_w} steps (dir {alt_dir}).")
+
+    # Apply your small (per-direction) offset from S2 center to true Disk Home
+    off = int(HOME_OFFSET_DIR.get(PREFERRED_HOME_APPROACH_DIR, 0))
     if off:
-        move_biased(off, CENTER_STEP_DELAY, approach_dir)
+        move_biased(off, CENTER_STEP_DELAY, PREFERRED_HOME_APPROACH_DIR)
 
-    # Light settle
-    #move_biased(3, CENTER_STEP_DELAY, approach_dir)
-    #move_biased(3, CENTER_STEP_DELAY, -approach_dir)
-
-    # Ensure both sensors OPEN with bounded micro-tweak
-    if _micro_tweak_around_center(approach_dir):
-        print("Arrived at home (both sensors OPEN).")
+    # Final bounded tweak to satisfy both sensors OPEN
+    if _micro_tweak_around_center(PREFERRED_HOME_APPROACH_DIR):
+        print("Arrived at Disk Home (both sensors OPEN).")
     else:
-        print("At reference, but both sensors not OPEN. Increase TWEAK_RANGE or adjust HOME_OFFSET_DIR.")
+        print("At reference, but both sensors not OPEN. Adjust TWEAK_RANGE or HOME_OFFSET_DIR.")
+
 
     # Zero counters and persist now that we have a fresh, indexed home
     _zero_s1_counters()
     step_count = 0
-    try:
-        _persist_step_count()
-    except NameError:
-        print("Step count persistence not implemented. Check File issue.")  # during early testing
-        pass
+    _persist_step_count()
+
 
 def go_optical_home():
     """
