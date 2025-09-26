@@ -1010,78 +1010,75 @@ def go_home2():
     """
     Rehome with awareness of current sensor state.
 
-    If S2 is already OPEN (likely already near home), do a single-pass centering
-    using the preferred approach direction, slow and bounded.
+    If S2 is already OPEN (likely near home):
+        1) Bump out of the window by REHOME_BUMP_STEPS in the *opposite* of approach_dir
+        2) Ensure we're BLOCKED
+        3) Do a normal centering pass in approach_dir (slow)
 
-    Otherwise (S2 not OPEN), do the normal fast pre-roll, then edge index & center.
+    If S2 is not OPEN:
+        - Optional fast pre-roll TOWARD home using approach_dir
+        - Center in approach_dir (fast first pass is OK)
     """
     global step_count
 
-    # Pick a direction from the sign of step_count (your convention: + => CW, - => CCW)
+    # Choose approach based on your convention; keep this mapping consistent
     if step_count > 0:
-        approach_dir = -1
+        approach_dir = -1   # e.g., if +step_count means you're CW of home, approach CCW
     elif step_count < 0:
-        approach_dir = 1
+        approach_dir = +1
     else:
-        approach_dir = +1  # arbitrary default when zero
+        approach_dir = +1   # default when exactly at home
 
     s2_is_open = not _read_blocked(optical_pin2)
+    bump_dir = -approach_dir  # leave the OPEN window opposite to the approach
 
-    REHOME_BUMP_DIR = approach_dir  # small bump to leave OPEN if needed
-    PREFERRED_HOME_APPROACH_DIR = -approach_dir  # main centering direction
+    print(f"[go_home2] step_count={step_count}, s2_open={s2_is_open}, approach_dir={approach_dir}, bump_dir={bump_dir}")
 
     try:
         if s2_is_open:
-            # 1) leave OPEN by a tiny, known bump
-            move_biased(REHOME_BUMP_STEPS, EDGE_STEP_DELAY, REHOME_BUMP_DIR)
-            # ensure we actually are on BLOCKED side now (no-ops if already blocked)
-            _step_until_state(optical_pin2, True,  REHOME_BUMP_DIR, EDGE_STEP_DELAY)
+            # --- ALREADY IN OPEN: do the simple “100-step then normal homing” ---
+            move_biased(REHOME_BUMP_STEPS, EDGE_STEP_DELAY, bump_dir)
+            _step_until_state(optical_pin2, True, bump_dir, EDGE_STEP_DELAY)  # ensure BLOCKED
 
-            # 2) ONE centering pass (slow) in preferred direction
-            open_w = _center_on_open_window(optical_pin2,
-                                            PREFERRED_HOME_APPROACH_DIR,
-                                            first_fast=False)
-            print(f"[Rehome@Open] S2 centered. OPEN width ≈ {open_w} steps "
-                  f"(dir {PREFERRED_HOME_APPROACH_DIR}).")
+            # Now do a single centering pass in the *approach_dir* (slow)
+            open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=False)
+            print(f"[Rehome@Open] S2 centered. OPEN≈{open_w} steps (dir {approach_dir}).")
 
         else:
-            # Optional sprint toward home just to reduce time (does not set direction)
+            # --- NOT IN OPEN: optional fast pre-roll TOWARD home in the SAME sign as approach_dir ---
             steps_far = abs(step_count)
             if steps_far > FAR_STEP_THRESHOLD:
-                fast_chunk_dir = +1 if step_count > 0 else -1
-                move_biased(steps_far - FAR_STEP_THRESHOLD, FAST_STEP_DELAY, fast_chunk_dir)
+                fast_steps = steps_far - FAR_STEP_THRESHOLD
+                move_biased(fast_steps, FAST_STEP_DELAY, approach_dir)  # <— use approach_dir here, not a separate fast_chunk_dir
 
-            # ONE centering pass (fast allowed) in preferred direction
-            open_w = _center_on_open_window(optical_pin2,
-                                            PREFERRED_HOME_APPROACH_DIR,
-                                            first_fast=True)
-            print(f"[Rehome] S2 centered. OPEN width ≈ {open_w} steps "
-                  f"(dir {PREFERRED_HOME_APPROACH_DIR}).")
+            # Center in approach_dir (fast first pass OK)
+            open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=True)
+            print(f"[Rehome] S2 centered. OPEN≈{open_w} steps (dir {approach_dir}).")
 
     except RuntimeError as e:
-        # Safety fallback: try the opposite approach direction once
-        alt_dir = -PREFERRED_HOME_APPROACH_DIR
-        print(f"[Rehome] Centering failed in dir {PREFERRED_HOME_APPROACH_DIR}: {e}. "
-              f"Retrying in dir {alt_dir}.")
+        # One safe retry in the opposite direction
+        alt_dir = -approach_dir
+        print(f"[Rehome] Centering failed in dir {approach_dir}: {e}. Retrying in dir {alt_dir}.")
         open_w = _center_on_open_window(optical_pin2, alt_dir, first_fast=False)
-        print(f"[Rehome] Retry succeeded. OPEN width ≈ {open_w} steps (dir {alt_dir}).")
+        print(f"[Rehome] Retry succeeded. OPEN≈{open_w} steps (dir {alt_dir}).")
+        approach_dir = alt_dir  # downstream offset/tweak should follow the dir actually used
 
-    # Apply your small (per-direction) offset from S2 center to true Disk Home
-    off = int(HOME_OFFSET_DIR.get(PREFERRED_HOME_APPROACH_DIR, 0))
+    # Apply per-direction offset from S2 center to true Disk Home
+    off = int(HOME_OFFSET_DIR.get(approach_dir, 0))
     if off:
-        move_biased(off, CENTER_STEP_DELAY, PREFERRED_HOME_APPROACH_DIR)
+        move_biased(off, CENTER_STEP_DELAY, approach_dir)
 
-    # Final bounded tweak to satisfy both sensors OPEN
-    if _micro_tweak_around_center(PREFERRED_HOME_APPROACH_DIR):
+    # Final bounded tweak so both sensors are OPEN
+    if _micro_tweak_around_center(approach_dir):
         print("Arrived at Disk Home (both sensors OPEN).")
     else:
         print("At reference, but both sensors not OPEN. Adjust TWEAK_RANGE or HOME_OFFSET_DIR.")
 
-
-    # Zero counters and persist now that we have a fresh, indexed home
-    _zero_s1_counters()
+    _zero_s1_counters()  # (doesn't touch step_count)
+    # If you want step_count to represent “steps from Disk Home”, keep this:
     step_count = 0
     _persist_step_count()
+
 
 
 def go_optical_home():
