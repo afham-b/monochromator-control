@@ -1150,29 +1150,18 @@ def go_optical_home():
     print(f"[OpticalHome] At optical home (offset {OPTICAL_HOME_OFFSET_STEPS} steps from disk home).")
 
 def find_optical_home_offset():
-    """
-    Guide: go to Disk Home, then step the stage until the user says they're at optical home.
-    Controls:
-      ↑  : +1 step (CW)
-      ↓  : -1 step (CCW)
-      PgUp / PgDn : ±10 steps
-      r  : reset this session's offset to 0 (return to Disk Home)
-      Enter or s : save offset and exit
-      q or Esc   : cancel without saving
-    """
-    global OPTICAL_HOME_OFFSET_STEPS
+    global OPTICAL_HOME_OFFSET_STEPS  # ok at function scope
 
     # 1) Start from a clean Disk Home
     go_home2()
 
-    # Live session offset we’re editing (don’t overwrite saved value until user saves)
     session_offset = 0
     running = True
 
     print("\n--- Set Optical Home Offset ---")
     print("Use ↑/↓ to nudge (PgUp/PgDn = ±10). Press Enter or 's' to save, 'r' to reset, 'q'/Esc to cancel.")
+    time.sleep(5)
 
-    # We use pynput's keyboard.Listener (already imported as 'keyboard' in your file)
     def _nudge(n):
         nonlocal session_offset
         if n == 0:
@@ -1184,6 +1173,7 @@ def find_optical_home_offset():
 
     def on_press(key):
         nonlocal running, session_offset
+        global OPTICAL_HOME_OFFSET_STEPS     # ← IMPORTANT: write to the real global
         try:
             if key == keyboard.Key.up:
                 _nudge(+1)
@@ -1197,7 +1187,13 @@ def find_optical_home_offset():
                 # Save & exit
                 OPTICAL_HOME_OFFSET_STEPS = session_offset
                 _persist_optical_offset()
-                print(f"[Saved] Optical-home offset set to {OPTICAL_HOME_OFFSET_STEPS} steps.")
+                # quick sanity check/readback
+                try:
+                    with open(OPTICAL_OFFSET_FILE, "r") as f:
+                        print(f"[Saved] Optical-home offset set to {OPTICAL_HOME_OFFSET_STEPS} steps "
+                              f"(file now has {f.read().strip()}).")
+                except Exception as e:
+                    print(f"[Saved] Offset persisted, but readback failed: {e}")
                 running = False
                 return False
             elif key == keyboard.Key.esc or (hasattr(key, "char") and key.char and key.char.lower() == 'q'):
@@ -1205,16 +1201,14 @@ def find_optical_home_offset():
                 running = False
                 return False
             elif hasattr(key, "char") and key.char and key.char.lower() == 'r':
-                # Return to Disk Home within this session
                 if session_offset != 0:
-                    _nudge(-session_offset)  # back to zero
+                    _nudge(-session_offset)
                     print("[Reset] Session offset reset to 0 (Disk Home).")
         except Exception as e:
             print(f"[Listener] {e}")
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
-
     try:
         while running:
             monitor_sensors()
