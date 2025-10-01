@@ -12,6 +12,9 @@ import sys
 import termios
 from pynput import keyboard
 
+# used to setup logging and control log file size
+from log_utils import TailTruncatingFileHandler, enforce_log_size_limit
+
 
 #windows
 # try:
@@ -1580,15 +1583,29 @@ def wait_for_initial_sensor_states():
 
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
-    # Reset root logger to avoid duplicate handlers after restarts
+
+    # Optional: trim on startup
+    try:
+        enforce_log_size_limit(LOG_FILE, max_bytes=10*1024*1024)
+    except Exception as e:
+        print(f"[LogTrim] Startup trim skipped: {e}")
+
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
     fmt = logging.Formatter('%(asctime)s - %(message)s')
 
-    fh = logging.FileHandler(LOG_FILE, mode='a')   # append to one file
+    # Use our tail-truncating handler
+    fh = TailTruncatingFileHandler(
+        LOG_FILE,
+        mode='a',
+        max_bytes=10 * 1024 * 1024,  # 10 MB cap
+        keep_bytes=8 * 1024 * 1024,  # keep last ~8 MB on trim
+        check_every=20               # check size every 20 emits
+    )
     fh.setFormatter(fmt)
+
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
 
