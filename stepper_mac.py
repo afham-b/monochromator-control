@@ -186,6 +186,58 @@ def calibrate_s2_steps_per_rev(approach_dir=+1):
 
 FAR_STEP_THRESHOLD_MOVE = 600   # if farther than this, sprint at FAST_STEP_DELAY
 
+
+# cancellimng functions
+CANCEL = False
+
+def _set_cancel(v=True):
+    global CANCEL
+    CANCEL = v
+
+def _check_cancel():
+    # Raise to unwind back to menus
+    if CANCEL:
+        raise _QuitToMain
+
+def _start_cancel_listener(hint="Press 'q' or Esc to cancel and return to the main menu."):
+    print(hint)
+    _set_cancel(False)
+
+    def on_press(key):
+        try:
+            if key == keyboard.Key.esc:
+                _set_cancel(True); return False
+            if hasattr(key, "char") and key.char and key.char.lower() == 'q':
+                _set_cancel(True); return False
+        except Exception:
+            pass  # never let listener crash
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    return listener
+
+def _stop_cancel_listener(listener):
+    try:
+        if listener: listener.stop()
+    finally:
+        _set_cancel(False)
+
+def _run_cancellable(fn, *args, **kwargs):
+    """
+    Start cancel listener, run fn, cleanly stop & release coils on cancel or completion.
+    """
+    listener = _start_cancel_listener()
+    try:
+        return fn(*args, **kwargs)
+    except _QuitToMain:
+        print("[Cancel] Aborted operation; returning to main menu.")
+    finally:
+        _stop_cancel_listener(listener)
+        # release coils so we don't keep holding torque if we bailed out mid-move
+        for pin in pins:
+            board.digital[pin].write(0)
+
+
 def _ensure_steps_per_deg():
     global S2_STEPS_PER_REV, STEPS_PER_DEG
     if S2_STEPS_PER_REV is None:
@@ -247,8 +299,8 @@ def move_to_angle_deg(theta_deg, mode="from_home_ccw"):
         _stage_move_signed(target_steps)
 
         # tiny settle (take out micro-backlash)
-        move_biased(3, CENTER_STEP_DELAY, +1 if target_steps>=0 else -1)
-        move_biased(3, CENTER_STEP_DELAY, -1 if target_steps>=0 else +1)
+        #move_biased(3, CENTER_STEP_DELAY, +1 if target_steps>=0 else -1)
+        #move_biased(3, CENTER_STEP_DELAY, -1 if target_steps>=0 else +1)
 
     elif mode == "shortest":
         # Move from wherever we are now.
@@ -300,6 +352,7 @@ def check_step_integrity(tolerance_steps=4):
 def move_biased(steps, step_delay, direction):
     # Apply direction-change backlash and steady-state reverse scaling.
     global _last_move_dir, _rev_scale_err_accum
+    _check_cancel() 
 
     # If direction changes, take up backlash in the new direction first.
     if _last_move_dir is not None and direction != _last_move_dir:
@@ -323,6 +376,7 @@ def move_biased(steps, step_delay, direction):
 
     move_stepper(seq, adj_steps, step_delay, direction)
     _last_move_dir = direction
+    _check_cancel() 
 
 
 def move_stepper(seq, steps,step_delay, direction):
@@ -336,6 +390,7 @@ def move_stepper(seq, steps,step_delay, direction):
     
 
     for _ in range(steps):
+        _check_cancel()
         for step in sequence:
             for pin, val in zip(pins, step):
                 board.digital[pin].write(val)
@@ -1308,28 +1363,28 @@ def home_menu():
         choice = input("Choose an option (1/2/3/4/Q): ").strip().lower()
 
         if choice == '1':
-            print("Moving to Disk Home...")
-            go_home2()
+            print("Moving to Disk Home... (press 'q' or Esc to cancel)")
+            _run_cancellable(go_home2)     # ← wrap it
             break
 
         elif choice == '2':
             try:
                 confirm = _prompt_or_quit("Are you sure you want to reset Disk Home? (y = yes, q=quit): ")
             except _QuitToMain:
-                print("Exiting home menu.")
-                break
+                print("Exiting home menu."); break
             if confirm.strip().lower() == 'y':
-                set_home()
+                _run_cancellable(set_home)  # optional wrap
                 break
             else:
                 print("Reset cancelled. Returning to home menu.")
 
         elif choice == '3':
+            # already has its own key handler; it's interactive & cancellable with 'q'
             find_optical_home_offset()
-            # stay in menu to allow immediate '4' if desired
 
         elif choice == '4':
-            go_optical_home()
+            print("Going to Optical Home... (press 'q' or Esc to cancel)")
+            _run_cancellable(go_optical_home)  # ← wrap it
             break
 
         elif choice == 'q':
@@ -1353,7 +1408,7 @@ def position_menu():
         if choice == "1":
             dirch = input("Approach S2 edge in direction [+/-] (ENTER=+): ").strip()
             approach_dir = -1 if dirch == "-" else +1
-            calibrate_s2_steps_per_rev(approach_dir=approach_dir)
+            _run_cancellable(calibrate_s2_steps_per_rev, approach_dir=approach_dir)  # optional
 
         elif choice == "2":
             try:
@@ -1361,13 +1416,12 @@ def position_menu():
                 theta = float(theta_s)
                 mode = _ask_approach_mode()   # may raise _QuitToMain
             except _QuitToMain:
-                print("Leaving Position menu.")
-                return
+                print("Leaving Position menu."); return
             except ValueError:
-                print("θ must be a number.")
-                continue
+                print("θ must be a number."); continue
 
-            move_to_angle_deg(theta, mode=mode)
+            print("Moving... (press 'q' or Esc to cancel)")
+            _run_cancellable(move_to_angle_deg, theta, mode=mode)
             ok, err = check_step_integrity()
             print(f"Integrity: {'OK' if ok else 'DRIFT'} (Δ={err} steps)  | step_count={step_count}")
 
@@ -1379,17 +1433,12 @@ def position_menu():
                 m   = int(m_s)
                 mode = _ask_approach_mode()   # may raise _QuitToMain
             except _QuitToMain:
-                print("Leaving Position menu.")
-                return
+                print("Leaving Position menu."); return
             except ValueError:
-                print("λ must be number, m must be integer.")
-                continue
+                print("λ must be number, m must be integer."); continue
 
-            try:
-                move_to_wavelength(lam, m, mode=mode)
-            except ValueError as e:
-                print(f"Error: {e}")
-                continue
+            print("Moving... (press 'q' or Esc to cancel)")
+            _run_cancellable(move_to_wavelength, lam, m, mode=mode)
             ok, err = check_step_integrity()
             print(f"Integrity: {'OK' if ok else 'DRIFT'} (Δ={err} steps)  | step_count={step_count}")
 
@@ -1404,6 +1453,7 @@ def position_menu():
             return
         else:
             print("Invalid option.")
+
 
 def _stage_move_signed(delta_steps):
     """
