@@ -133,6 +133,13 @@ STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0     # derived (S2_STEPS_PER_REV / 360)
 def _s2_steps_fallback():
     return revs_per_rotation * steps_per_rev + delta_steps
 
+# grabbing calibration data from cal_store.py if available
+try:
+    from cal_store import load_cal, save_cal, CalData
+except Exception:
+    load_cal = save_cal = CalData = None
+# One live calibration instance (loaded on startup)
+_cal = None
 
 # Define your step sequence (half-step example)
 seq = [
@@ -150,6 +157,46 @@ seq = [
 step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
 
+def _apply_cal_to_runtime():
+    """
+    Copy values from _cal into the globals the motion code uses.
+    Safe to call multiple times.
+    """
+    global S2_STEPS_PER_REV, STEPS_PER_DEG
+    global BACKLASH_STEPS, DIR_REVERSE_SCALE, HOME_OFFSET_DIR
+
+    if _cal is None:
+        return
+
+    if _cal.S2_STEPS_PER_REV:
+        S2_STEPS_PER_REV = _cal.S2_STEPS_PER_REV
+        STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0
+
+    if _cal.HOME_OFFSET_DIR:
+        HOME_OFFSET_DIR = dict(_cal.HOME_OFFSET_DIR)
+
+    if _cal.BACKLASH_STEPS is not None:
+        BACKLASH_STEPS = int(_cal.BACKLASH_STEPS)
+
+    if _cal.DIR_REVERSE_SCALE is not None:
+        DIR_REVERSE_SCALE = float(_cal.DIR_REVERSE_SCALE)
+
+
+def _save_runtime_to_cal():
+    """
+    Copy current runtime values into _cal and save.
+    Call this after you finish a calibration step.
+    """
+    global _cal
+    if _cal is None:
+        return
+    _cal.S2_STEPS_PER_REV = int(S2_STEPS_PER_REV)
+    _cal.HOME_OFFSET_DIR = dict(HOME_OFFSET_DIR)
+    _cal.BACKLASH_STEPS = int(BACKLASH_STEPS)
+    _cal.DIR_REVERSE_SCALE = float(DIR_REVERSE_SCALE)
+    save_cal(_cal)
+
+
 def wavelength_to_theta_deg(lambda_nm, order_m, d_mm=GRATING_D_MM):
     """
     Uses your relation: m * λ = d * sin(theta)
@@ -162,6 +209,70 @@ def wavelength_to_theta_deg(lambda_nm, order_m, d_mm=GRATING_D_MM):
         raise ValueError(f"Unreachable angle: |m*λ/d| = {arg:.6f} > 1")
     theta_rad = math.asin(arg)
     return math.degrees(theta_rad)
+
+def _deg_to_littrow_term(theta_deg, d_mm=GRATING_D_MM):
+    """
+    Return X = (2*d) * sin(theta) in mm for Littrow (m*λ = 2d sinθ).
+    We'll fit λ_nm ≈ a + b * (X_mm * 1e6)  where X is converted to nm.
+    """
+    x_mm = 2.0 * d_mm * math.sin(math.radians(theta_deg))
+    return x_mm * 1e6  # convert mm -> nm
+
+def _fit_littrow_linear(points):
+    """
+    points: list of dicts with keys (theta_deg, lambda_nm, order_m)
+    We reduce to y = λ_nm / m vs. X = (2d sinθ)_nm  and fit λ0 ≈ a + b * X
+    Returns (a, b).
+    """
+    X, Y = [], []
+    for p in points:
+        m = float(p["order_m"])
+        if m == 0:
+            # for m=0 order, Littrow gives λ/m undefined; skip or treat as λ≈a (X=0),
+            # but we generally use m≠0 references for robust fit.
+            continue
+        X.append(_deg_to_littrow_term(p["theta_deg"]))
+        Y.append(p["lambda_nm"] / m)
+    if len(X) < 2:
+        raise ValueError("Need at least two nonzero-order references to fit Littrow linear model.")
+    n = len(X)
+    sumx = sum(X); sumy = sum(Y)
+    sumxx = sum(x*x for x in X)
+    sumxy = sum(x*y for x,y in zip(X,Y))
+    denom = n*sumxx - sumx*sumx
+    if abs(denom) < 1e-9:
+        raise ValueError("Degenerate Littrow fit (colinear sums).")
+    b = (n*sumxy - sumx*sumy) / denom
+    a = (sumy - b*sumx) / n
+    return a, b
+
+def _theta_deg_from_lambda(lambda_nm, order_m):
+    """
+    Use saved _cal.WL_MODEL (a, b) if available; otherwise fall back to pure Littrow.
+    Model: λ/m ≈ a + b * X, where X = (2d sinθ) in nm.
+    Solve for θ: sinθ = ((λ/m - a)/(b*2d_mm*1e6))
+    """
+    global _cal
+    a = b = None
+    if _cal and _cal.WL_MODEL and "a" in _cal.WL_MODEL and "b" in _cal.WL_MODEL:
+        a = float(_cal.WL_MODEL["a"])
+        b = float(_cal.WL_MODEL["b"])
+
+    # If we have a,b, use them; else b=1, a=0 (ideal Littrow)
+    if a is None or b is None:
+        a = 0.0
+        b = 1.0
+
+    # compute target X_nm
+    target = (lambda_nm / float(order_m)) - a
+    denom = b * (2.0 * GRATING_D_MM * 1e6)  # b * (2d)_nm
+    if abs(denom) < 1e-12:
+        raise ValueError("Invalid wavelength model (b near zero).")
+    arg = target / denom
+    if abs(arg) > 1.0:
+        raise ValueError(f"Requested λ={lambda_nm} nm, m={order_m} not reachable (|sinθ|={arg:.6f}>1).")
+    return math.degrees(math.asin(arg))
+
 
 def calibrate_s2_steps_per_rev(approach_dir=+1):
     """
@@ -185,7 +296,15 @@ def calibrate_s2_steps_per_rev(approach_dir=+1):
     S2_STEPS_PER_REV = steps
     STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0
     print(f"[Cal] S2_STEPS_PER_REV = {S2_STEPS_PER_REV}, STEPS_PER_DEG = {STEPS_PER_DEG:.6f}")
+
+    # Persist into calibration JSON if available
+    if _cal is not None:
+        _cal.S2_STEPS_PER_REV = int(S2_STEPS_PER_REV)
+        save_cal(_cal)
+
+
     return S2_STEPS_PER_REV
+
 
 FAR_STEP_THRESHOLD_MOVE = 600   # if farther than this, sprint at FAST_STEP_DELAY
 
@@ -324,6 +443,18 @@ def move_to_angle_deg(theta_deg, mode="from_home_ccw"):
     else:
         raise ValueError("mode must be 'from_home_ccw' or 'shortest'")
 
+#trying litrow with m*lambda = d*(sin(alpha)-sin(beta))
+def move_to_wavelength_nonlinear(lambda_nm, order_m, mode="from_home_ccw"):
+    # θ from model if present; otherwise ideal Littrow
+    try:
+        theta = _theta_deg_from_lambda(lambda_nm, order_m)
+    except ValueError as e:
+        print(f"[WL] {e}")
+        return
+    print(f"Target θ = {theta:.4f}° for λ={lambda_nm} nm, m={order_m}")
+    move_to_angle_deg(theta, mode=mode)
+
+#linear litrow fit with m*lambda = d*sin(theta), where theta is the grating angle. 
 def move_to_wavelength(lambda_nm, order_m, mode="from_home_ccw"):
     theta = wavelength_to_theta_deg(lambda_nm, order_m)
     print(f"Target θ = {theta:.4f}° for λ={lambda_nm} nm, m={order_m}")
@@ -599,6 +730,11 @@ def calibrate_directional_bias(pin=optical_pin, approach_dir=1, verbose=True):
         else:
             print("Note: Non-unity reverse scale detected (steady-state bias).")
 
+    if _cal is not None:
+        _cal.BACKLASH_STEPS = int(BACKLASH_STEPS)
+        _cal.DIR_REVERSE_SCALE = float(DIR_REVERSE_SCALE)
+        save_cal(_cal)
+
     return {
         "forward_steps": f_steps,
         "reverse_first": r_first,
@@ -725,6 +861,77 @@ def calibration():
             print("Invalid input. Enter 1, 2, or Q.")
 
     return
+
+def wl_cal_menu():
+    """
+    Build or refine wavelength model:
+      1) Add a reference (current angle or typed angle) with known λ, m
+      2) Fit model (a,b) and save
+      3) Show current model
+      q) back
+    """
+    global _cal
+    if _cal is None:
+        print("[WL Cal] Calibration store not available."); return
+    while True:
+        print("\n--- Wavelength Calibration ---")
+        print("1) Add reference using CURRENT angle θ")
+        print("2) Add reference by ENTERING angle θ")
+        print("3) Fit and save model (a,b)")
+        print("4) Show current references and model")
+        print("q) Back")
+        ch = input("Select: ").strip().lower()
+        if ch == "1":
+            try:
+                lam = float(input("λ (nm): ").strip())
+                m   = int(input("order m (integer, nonzero): ").strip())
+            except Exception:
+                print("Invalid λ or m."); continue
+            # Estimate current θ from step_count and STEPS_PER_DEG:
+            _ensure_steps_per_deg()
+            theta_now = step_count / STEPS_PER_DEG
+            _cal.add_ref(lambda_nm=lam, order_m=m, theta_deg=theta_now)
+            save_cal(_cal)
+            print(f"[WL Cal] Added ref: θ={theta_now:.6f}°, λ={lam} nm, m={m}")
+
+        elif ch == "2":
+            try:
+                theta = float(input("θ (deg): ").strip())
+                lam   = float(input("λ (nm): ").strip())
+                m     = int(input("order m (integer, nonzero): ").strip())
+            except Exception:
+                print("Invalid entry."); continue
+            _cal.add_ref(lambda_nm=lam, order_m=m, theta_deg=theta)
+            save_cal(_cal)
+            print(f"[WL Cal] Added ref: θ={theta:.6f}°, λ={lam} nm, m={m}")
+
+        elif ch == "3":
+            try:
+                a,b = _fit_littrow_linear(_cal.WL_REFS or [])
+                _cal.WL_MODEL = {"a": a, "b": b}
+                save_cal(_cal)
+                print(f"[WL Cal] Fit done. a={a:.6f}, b={b:.6f}  (λ/m ≈ a + b·(2d sinθ)_nm)")
+            except Exception as e:
+                print(f"[WL Cal] Fit failed: {e}")
+
+        elif ch == "4":
+            print("Refs:")
+            if not _cal.WL_REFS:
+                print("  (none)")
+            else:
+                for i,r in enumerate(_cal.WL_REFS):
+                    print(f"  {i+1}: θ={r['theta_deg']:.6f}°, λ={r['lambda_nm']} nm, m={r['order_m']}")
+            if _cal.WL_MODEL:
+                a=_cal.WL_MODEL.get("a"); b=_cal.WL_MODEL.get("b")
+                print(f"Model: λ/m ≈ {a:.6f} + {b:.6f}·(2d sinθ)_nm")
+            else:
+                print("Model: (none) — uses ideal Littrow fallback (a=0, b=1)")
+
+        elif ch == "q":
+            return
+        else:
+            print("Invalid option.")
+
 
 
 
@@ -1398,6 +1605,7 @@ def position_menu():
         print("2) Move to angle θ (degrees)")
         print("3) Move to wavelength λ (nm) & order m")
         print("4) Show current S2 steps/deg and integrity check")
+        print("5) Wavelength calibration (refs & fit)") 
         print("Q) Back to main menu")
 
         choice = input("Select: ").strip().lower()
@@ -1444,6 +1652,9 @@ def position_menu():
             print(f"S2_STEPS_PER_REV={S2_STEPS_PER_REV}, STEPS_PER_DEG={STEPS_PER_DEG:.6f}")
             ok, err = check_step_integrity()
             print(f"Integrity: {'OK' if ok else 'DRIFT'} (Δ={err} steps)  | step_count={step_count}")
+
+        elif choice == "5":
+            wl_cal_menu()
 
         elif choice in ("q", "Q"):
             print("Leaving Position menu.")
@@ -1667,6 +1878,21 @@ def main():
 
     # NEW: restore optical-home offset
     _load_optical_offset()
+
+    #Load calibration JSON and apply to runtime ---
+    global _cal
+    try:
+        cal_path = os.path.join(STATE_DIR, "calibration.json")
+        _cal = load_cal(cal_path) if load_cal else None
+        if _cal:
+            print(f"[Cal] Loaded calibration from {cal_path}")
+            _apply_cal_to_runtime()
+        else:
+            print("[Cal] No calibration file yet; defaults remain.")
+    except Exception as e:
+        print(f"[Cal] Failed to load calibration: {e}")
+        _cal = None
+
 
     logging.info("Starting stepper motor control")
 
