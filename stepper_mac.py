@@ -135,7 +135,7 @@ def _s2_steps_fallback():
 
 # grabbing calibration data from cal_store.py if available
 try:
-    from cal_store import load_cal, save_cal, CalData
+    from cal_store import save_cal, load_cal, apply_cal_to_globals
 except Exception:
     load_cal = save_cal = CalData = None
 # One live calibration instance (loaded on startup)
@@ -298,12 +298,18 @@ def calibrate_s2_steps_per_rev(approach_dir=+1):
     print(f"[Cal] S2_STEPS_PER_REV = {S2_STEPS_PER_REV}, STEPS_PER_DEG = {STEPS_PER_DEG:.6f}")
 
     # Persist into calibration JSON if available
-    if _cal is not None:
-        _cal.S2_STEPS_PER_REV = int(S2_STEPS_PER_REV)
-        save_cal(_cal)
+    # if _cal is not None:
+    #     _cal.S2_STEPS_PER_REV = int(S2_STEPS_PER_REV)
+    #     save_cal(_cal)
 
-
+    path = save_cal(
+        STATE_DIR,
+        s2_steps_per_rev=S2_STEPS_PER_REV,
+        steps_per_deg=STEPS_PER_DEG
+    )
+    print(f"[Cal] S2 saved to: {path}")
     return S2_STEPS_PER_REV
+
 
 
 FAR_STEP_THRESHOLD_MOVE = 600   # if farther than this, sprint at FAST_STEP_DELAY
@@ -730,19 +736,26 @@ def calibrate_directional_bias(pin=optical_pin, approach_dir=1, verbose=True):
         else:
             print("Note: Non-unity reverse scale detected (steady-state bias).")
 
-    if _cal is not None:
-        _cal.BACKLASH_STEPS = int(BACKLASH_STEPS)
-        _cal.DIR_REVERSE_SCALE = float(DIR_REVERSE_SCALE)
-        save_cal(_cal)
+    # if _cal is not None:
+    #     _cal.BACKLASH_STEPS = int(BACKLASH_STEPS)
+    #     _cal.DIR_REVERSE_SCALE = float(DIR_REVERSE_SCALE)
+    #     save_cal(_cal)
 
-    return {
+    out = {
         "forward_steps": f_steps,
         "reverse_first": r_first,
         "reverse_steady": r_steady,
         "backlash_steps": BACKLASH_STEPS,
         "reverse_scale": DIR_REVERSE_SCALE,
     }
-
+    # SAVE:
+    path = save_cal(
+        STATE_DIR,
+        backlash_steps=BACKLASH_STEPS,
+        reverse_scale=DIR_REVERSE_SCALE
+    )
+    print(f"[Cal] Backlash saved to: {path}")
+    return out
 
 def calibration():
     global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, steps_per_rev, revs_per_rotation, steps_since_rev
@@ -791,13 +804,18 @@ def calibration():
             print("Total steps for one revolution of small disk:", step_count)
             steps_per_rev = step_count-initial_step_count
 
+
+            path = save_cal(STATE_DIR, s1_steps_per_rev=steps_per_rev)
+            print(f"[Cal] S1 steps/rev saved to: {path}")
+        
             break
 
         elif choice == '2':
             print("Calibrating worm gear...")
-            print("Please use jog mode to set worm gear to home, quit jog mode, then run calibration steps as needed.")
-            time.sleep(3)
-            jog_mode2(step_delay=0.001)
+            # Move to home position first
+            print("Homing worm gear (large disk) before calibration...please wait...")
+            time.sleep(4)
+            go_home2()
             print("Big gear homed, begining calibration")
 
             calibration_step_counter =0 
@@ -1194,81 +1212,6 @@ def _zero_s1_counters():
     is_1rev_completed = False
     transition_sequence = ["OPEN"]
     last_switch1_state = None
-
-
-#edge + step based homing function, as opposed to the only step based homing function gohome() 
-# def go_home2():
-#     """
-#     Rehome with awareness of current sensor state.
-
-#     If S2 is already OPEN (likely already at/near home), do a *slow* edge capture
-#     based on the signed step_count (leave OPEN -> hit BLOCKED, then capture the
-#     next BLOCKED->OPEN edge), then center and micro-tweak.
-
-#     Otherwise (S2 not open), keep the existing fast-pre-roll + index/center.
-#     """
-#     global step_count
-
-#     # Pick a direction from the sign of step_count (your convention: + => CW, - => CCW)
-#     if step_count > 0:
-#         approach_dir = -1
-#     elif step_count < 0:
-#         approach_dir = 1
-#     else:
-#         approach_dir = +1  # arbitrary default when zero
-
-#     s2_is_open = not _read_blocked(optical_pin2)
-
-#     if s2_is_open:
-#         # --- Rehoming while already in S2's OPEN window ---
-#         # 1) Leave OPEN to BLOCKED (slow)
-#         _step_until_state(optical_pin2, True,  approach_dir, EDGE_STEP_DELAY)
-#         # 2) Now capture the BLOCKED->OPEN rising edge (slow)
-#         _step_until_state(optical_pin2, False, approach_dir, EDGE_STEP_DELAY)
-#         # 3) Center on the window (do NOT use a fast first pass)
-#         try:
-#             open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=False)
-#             print(f"[Rehome] S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
-#         except RuntimeError as e:
-#             print(f"[Rehome] S2 centering failed: {e}")
-#             return
-#     else:
-#         # --- Normal approach: optionally fast pre-roll, then index/center ---
-#         steps_far = abs(step_count)
-#         if steps_far > FAR_STEP_THRESHOLD:
-#             fast_steps = steps_far - FAR_STEP_THRESHOLD
-#             move_biased(fast_steps, FAST_STEP_DELAY, approach_dir)
-
-#         try:
-#             open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=True)
-#             print(f"S2 centered. OPEN width ≈ {open_w} steps (dir {approach_dir}).")
-#         except RuntimeError as e:
-#             print(f"[Homing] S2 centering failed: {e}")
-#             return
-
-#     # Apply your calibrated small offset (directional) from S2 center to true home
-#     off = int(HOME_OFFSET_DIR.get(approach_dir, 0))
-#     if off:
-#         move_biased(off, CENTER_STEP_DELAY, approach_dir)
-
-#     # Light settle
-#     #move_biased(3, CENTER_STEP_DELAY, approach_dir)
-#     #move_biased(3, CENTER_STEP_DELAY, -approach_dir)
-
-#     # Ensure both sensors OPEN with bounded micro-tweak
-#     if _micro_tweak_around_center(approach_dir):
-#         print("Arrived at home (both sensors OPEN).")
-#     else:
-#         print("At reference, but both sensors not OPEN. Increase TWEAK_RANGE or adjust HOME_OFFSET_DIR.")
-
-#     # Zero counters and persist now that we have a fresh, indexed home
-#     _zero_s1_counters()
-#     step_count = 0
-#     try:
-#         _persist_step_count()
-#     except NameError:
-#         print("Step count persistence not implemented. Check File issue.")  # during early testing
-#         pass
 
 
 def go_home2():
@@ -1866,7 +1809,7 @@ def _load_optical_offset():
 
 
 def main():
-    global step_delay
+    global step_delay, S2_STEPS_PER_REV, STEPS_PER_DEG, BACKLASH_STEPS, DIR_REVERSE_SCALE, steps_per_rev
 
     wait_for_initial_sensor_states()
 
@@ -1879,19 +1822,20 @@ def main():
     # NEW: restore optical-home offset
     _load_optical_offset()
 
-    #Load calibration JSON and apply to runtime ---
-    global _cal
-    try:
-        cal_path = os.path.join(STATE_DIR, "calibration.json")
-        _cal = load_cal(cal_path) if load_cal else None
-        if _cal:
-            print(f"[Cal] Loaded calibration from {cal_path}")
-            _apply_cal_to_runtime()
-        else:
-            print("[Cal] No calibration file yet; defaults remain.")
-    except Exception as e:
-        print(f"[Cal] Failed to load calibration: {e}")
-        _cal = None
+
+    # >>> LOAD CALIBRATION <<<
+    cal = load_cal(STATE_DIR)
+    apply_cal_to_globals(cal, globals())
+
+    # If steps/deg missing (first run), fall back to your existing fallback:
+    if globals().get("STEPS_PER_DEG") in (None, 0):
+        # You already have _s2_steps_fallback() defined
+        S2_STEPS_PER_REV = _s2_steps_fallback()
+        STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0 # this should be near 50 steps/deg
+        print(f"[Cal] Using fallback S2_STEPS_PER_REV={S2_STEPS_PER_REV} → STEPS_PER_DEG={STEPS_PER_DEG:.6f}")
+    else:
+        print(f"[Cal] Loaded: S2_STEPS_PER_REV={S2_STEPS_PER_REV}, STEPS_PER_DEG={STEPS_PER_DEG:.6f}, "
+              f"BACKLASH={BACKLASH_STEPS}, REVERSE_SCALE={DIR_REVERSE_SCALE}")
 
 
     logging.info("Starting stepper motor control")
