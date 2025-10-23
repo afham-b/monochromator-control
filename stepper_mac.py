@@ -100,13 +100,13 @@ EDGE_HOLDOFF_STEPS = 6       # min steps between edges to consider another edge 
 
 
 #Homing config
-HOME_OFFSET_DIR = {+1: 15, -1: 15}  # steps from S2 center toward the approach_dir to exact home
+HOME_OFFSET_DIR = {+1: 20, -1: 20}  # steps from S2 center toward the approach_dir to exact home
 FAST_STEP_DELAY   = 0.001
 EDGE_STEP_DELAY   = 0.004
 CENTER_STEP_DELAY = 0.006
 TWEAK_STEP_DELAY  = 0.008
 MAX_FIND_STEPS    = 20000       # hard cap so loops can't run forever
-TWEAK_RANGE       = 60           # +/- small steps to satisfy "both open"
+TWEAK_RANGE       = 100           # +/- small steps to satisfy "both open"
 FAR_STEP_THRESHOLD = 200   # steps to consider "far" for fast pre-roll
 REHOME_BUMP_STEPS  = 100   # how far to leave the OPEN window when already at home
 
@@ -818,53 +818,32 @@ def calibration():
             go_home2()
             print("Big gear homed, begining calibration")
 
-            calibration_step_counter =0 
-            initial_rev_count = rev_count
-            calibration_rev=0 
-
-            transition_sequence2 = ["OPEN"]
             last_switch2_state = "OPEN"
             found_blocked = False
-
-            while True:
-            # Step forward once
-                move_stepper(seq, 1, step_delay=0.001, direction=1)
-                calibration_step_counter += 1 
-                if rev_count - initial_rev_count > 0:
-                    calibration_rev = rev_count-initial_rev_count
-            # Check optical switch 2 state
-                switch2 = board.digital[optical_pin2].read()
-                if switch2 is None:
-                    state2 = "WAITING"
-                elif switch2:
-                    state2 = "BLOCKED"
-                else:
-                    state2 = "OPEN"
             
-            # Track transition: OPEN -> BLOCKED -> OPEN
-                # if last_switch2_state is not None:
-                #     if state2 != last_switch2_state:
-                #         transition_sequence.append(state2)
-                #         if len(transition_sequence) > 3:
-                #             transition_sequence.pop(0)
-                #         if transition_sequence == ["OPEN", "BLOCKED", "OPEN"]:
-                #             print("Completed one revolution of worm gear!")
-                #             break
+            dirch = input("Approach S2 edge in direction [+/-] (ENTER=+): ").strip()
+            approach_dir = -1 if dirch == "-" else +1
+            steps = calibrate_s2_steps_per_rev(approach_dir=approach_dir)
 
-                state2 = "BLOCKED" if board.digital[optical_pin2].read() else "OPEN"
-                if not found_blocked and state2 == "BLOCKED":
-                    found_blocked = True
-                if found_blocked and state2 == "OPEN":
-                    print("Completed one revolution (open->blocked->open) on worm gear.")
-                    break
-                last_switch2_state = state2  # Update for next loop
+            #_run_cancellable(calibrate_s2_steps_per_rev, approach_dir=approach_dir)  # optional
 
-            print('Number of revs and steps: ', calibration_rev , ' revs , ' ,steps_since_rev, ' steps.')
-            print('Number of total steps: ', calibration_step_counter)
-            print('Resetting worm gear back home, stepping in reverse')
-            time.sleep(5)
-            move_stepper(seq, calibration_step_counter, step_delay=0.001, direction= -1)
-            print('Worm gear back home, Number of total steps: ', calibration_step_counter)
+            if steps is None:
+                print("[Cal S2] Failed to measure a full cycle. Check sensor and try again.")
+                return
+
+            # Persist to calibration store (so it loads next run)
+            try:
+                from cal_store import load_cal, save_cal
+                cal = load_cal(STATE_DIR)
+                cal["s2_steps_per_rev"] = int(steps)
+                cal["steps_per_deg"] = steps / 360.0
+                save_cal(cal, STATE_DIR)
+                print(f"[Cal S2] Saved: s2_steps_per_rev={steps}, steps_per_deg={steps/360.0:.6f}")
+            except Exception as e:
+                print(f"[Cal S2] Could not save calibration: {e}")
+
+            # Optional: re-home at the end so you leave the system in a known state
+            go_home2()
 
         elif choice == '3':
             print("Calibrating directional bias/backlash on small disk (sensor 1)...")
@@ -1556,7 +1535,23 @@ def position_menu():
         if choice == "1":
             dirch = input("Approach S2 edge in direction [+/-] (ENTER=+): ").strip()
             approach_dir = -1 if dirch == "-" else +1
-            _run_cancellable(calibrate_s2_steps_per_rev, approach_dir=approach_dir)  # optional
+            #_run_cancellable(calibrate_s2_steps_per_rev, approach_dir=approach_dir)  # optional
+
+            steps = calibrate_s2_steps_per_rev(approach_dir=approach_dir)
+
+            # Persist to calibration store (so it loads next run)
+            try:
+                from cal_store import load_cal, save_cal
+                cal = load_cal(STATE_DIR)
+                cal["s2_steps_per_rev"] = int(steps)
+                cal["steps_per_deg"] = steps / 360.0
+                save_cal(cal, STATE_DIR)
+                print(f"[Cal S2] Saved: s2_steps_per_rev={steps}, steps_per_deg={steps/360.0:.6f}")
+            except Exception as e:
+                print(f"[Cal S2] Could not save calibration: {e}")
+
+            # Optional: re-home at the end so you leave the system in a known state
+            go_home2()
 
         elif choice == "2":
             try:
@@ -1809,7 +1804,7 @@ def _load_optical_offset():
 
 
 def main():
-    global step_delay, S2_STEPS_PER_REV, STEPS_PER_DEG, BACKLASH_STEPS, DIR_REVERSE_SCALE, steps_per_rev
+    global step_delay, S2_STEPS_PER_REV, STEPS_PER_DEG, BACKLASH_STEPS, DIR_REVERSE_SCALE, steps_per_rev, cal
 
     wait_for_initial_sensor_states()
 
@@ -1826,6 +1821,10 @@ def main():
     # >>> LOAD CALIBRATION <<<
     cal = load_cal(STATE_DIR)
     apply_cal_to_globals(cal, globals())
+
+    if "s2_steps_per_rev" in cal:
+        S2_STEPS_PER_REV = int(cal["s2_steps_per_rev"])
+        STEPS_PER_DEG = float(cal.get("steps_per_deg", S2_STEPS_PER_REV / 360.0))
 
     # If steps/deg missing (first run), fall back to your existing fallback:
     if globals().get("STEPS_PER_DEG") in (None, 0):

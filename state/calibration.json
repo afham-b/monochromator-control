@@ -12,9 +12,9 @@
     "steps_per_rev": 100
   },
   "s2": {
-    "steps_per_deg": null,
-    "steps_per_rev": null
+    "steps_per_deg": 50.044444444444444,
+    "steps_per_rev": 18016
   },
-  "saved_at": 1760472773.9172218,
+  "saved_at": 1761259553.8969631,
   "version": 1
 }
