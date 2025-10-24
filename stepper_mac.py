@@ -135,9 +135,17 @@ def _s2_steps_fallback():
 
 # grabbing calibration data from cal_store.py if available
 try:
-    from cal_store import save_cal, load_cal, apply_cal_to_globals
+    from cal_store import (
+    save_cal,
+    load_cal,
+    apply_cal_to_globals,
+    load_wl_cal,
+    save_wl_cal,
+)
 except Exception:
     load_cal = save_cal = CalData = None
+    
+
 # One live calibration instance (loaded on startup)
 _cal = None
 
@@ -248,22 +256,20 @@ def _fit_littrow_linear(points):
 
 def _theta_deg_from_lambda(lambda_nm, order_m):
     """
-    Use saved _cal.WL_MODEL (a, b) if available; otherwise fall back to pure Littrow.
+    Use saved _cal['wl_model'] (a, b) if available; otherwise fall back to ideal Littrow.
     Model: λ/m ≈ a + b * X, where X = (2d sinθ) in nm.
     Solve for θ: sinθ = ((λ/m - a)/(b*2d_mm*1e6))
     """
-    global _cal
-    a = b = None
-    if _cal and _cal.WL_MODEL and "a" in _cal.WL_MODEL and "b" in _cal.WL_MODEL:
-        a = float(_cal.WL_MODEL["a"])
-        b = float(_cal.WL_MODEL["b"])
+    global _cal 
+    model = None
+    if isinstance(_cal, dict):
+        model = _cal.get("wl_model")
+    if model and "a" in model and "b" in model:
+        a = float(model["a"]); b = float(model["b"])
+    else:
+        a = 0.0; b = 1.0  # ideal Littrow fallback
 
-    # If we have a,b, use them; else b=1, a=0 (ideal Littrow)
-    if a is None or b is None:
-        a = 0.0
-        b = 1.0
 
-    # compute target X_nm
     target = (lambda_nm / float(order_m)) - a
     denom = b * (2.0 * GRATING_D_MM * 1e6)  # b * (2d)_nm
     if abs(denom) < 1e-12:
@@ -272,6 +278,7 @@ def _theta_deg_from_lambda(lambda_nm, order_m):
     if abs(arg) > 1.0:
         raise ValueError(f"Requested λ={lambda_nm} nm, m={order_m} not reachable (|sinθ|={arg:.6f}>1).")
     return math.degrees(math.asin(arg))
+
 
 
 def calibrate_s2_steps_per_rev(approach_dir=+1):
@@ -302,6 +309,11 @@ def calibrate_s2_steps_per_rev(approach_dir=+1):
     #     _cal.S2_STEPS_PER_REV = int(S2_STEPS_PER_REV)
     #     save_cal(_cal)
 
+    _ensure_cal_ready()
+    _cal["s2_steps_per_rev"] = int(S2_STEPS_PER_REV)
+    _cal["steps_per_deg"]    = float(STEPS_PER_DEG)
+    _save_cal_now()
+
     path = save_cal(
         STATE_DIR,
         s2_steps_per_rev=S2_STEPS_PER_REV,
@@ -309,7 +321,6 @@ def calibrate_s2_steps_per_rev(approach_dir=+1):
     )
     print(f"[Cal] S2 saved to: {path}")
     return S2_STEPS_PER_REV
-
 
 
 FAR_STEP_THRESHOLD_MOVE = 600   # if farther than this, sprint at FAST_STEP_DELAY
@@ -859,6 +870,27 @@ def calibration():
 
     return
 
+def _ensure_cal_ready():
+    """Make sure _cal is a dict with wl_refs/wl_model present."""
+    global _cal
+    if not isinstance(_cal, dict):
+        _cal = {}
+    _cal.setdefault("wl_refs", [])
+    _cal.setdefault("wl_model", None)
+    return _cal
+
+def _save_cal_now():
+    """Persist _cal using your cal_store API."""
+    global _cal
+    # unify on dict-save signature
+    try:
+        save_cal(_cal, STATE_DIR)
+    except TypeError:
+        # if your save_cal is the older "save_cal(dir, **fields)" form,
+        # fall back gracefully:
+        save_cal(STATE_DIR, **_cal)
+
+
 def wl_cal_menu():
     """
     Build or refine wavelength model:
@@ -868,8 +900,8 @@ def wl_cal_menu():
       q) back
     """
     global _cal
-    if _cal is None:
-        print("[WL Cal] Calibration store not available."); return
+    _ensure_cal_ready()
+
     while True:
         print("\n--- Wavelength Calibration ---")
         print("1) Add reference using CURRENT angle θ")
@@ -878,17 +910,17 @@ def wl_cal_menu():
         print("4) Show current references and model")
         print("q) Back")
         ch = input("Select: ").strip().lower()
+
         if ch == "1":
             try:
                 lam = float(input("λ (nm): ").strip())
                 m   = int(input("order m (integer, nonzero): ").strip())
             except Exception:
                 print("Invalid λ or m."); continue
-            # Estimate current θ from step_count and STEPS_PER_DEG:
             _ensure_steps_per_deg()
             theta_now = step_count / STEPS_PER_DEG
-            _cal.add_ref(lambda_nm=lam, order_m=m, theta_deg=theta_now)
-            save_cal(_cal)
+            _cal["wl_refs"].append({"theta_deg": theta_now, "lambda_nm": lam, "order_m": int(m)})
+            _save_cal_now()
             print(f"[WL Cal] Added ref: θ={theta_now:.6f}°, λ={lam} nm, m={m}")
 
         elif ch == "2":
@@ -898,29 +930,30 @@ def wl_cal_menu():
                 m     = int(input("order m (integer, nonzero): ").strip())
             except Exception:
                 print("Invalid entry."); continue
-            _cal.add_ref(lambda_nm=lam, order_m=m, theta_deg=theta)
-            save_cal(_cal)
+            _cal["wl_refs"].append({"theta_deg": theta, "lambda_nm": lam, "order_m": int(m)})
+            _save_cal_now()
             print(f"[WL Cal] Added ref: θ={theta:.6f}°, λ={lam} nm, m={m}")
 
         elif ch == "3":
             try:
-                a,b = _fit_littrow_linear(_cal.WL_REFS or [])
-                _cal.WL_MODEL = {"a": a, "b": b}
-                save_cal(_cal)
+                a, b = _fit_littrow_linear(_cal.get("wl_refs", []))
+                _cal["wl_model"] = {"a": a, "b": b}
+                _save_cal_now()
                 print(f"[WL Cal] Fit done. a={a:.6f}, b={b:.6f}  (λ/m ≈ a + b·(2d sinθ)_nm)")
             except Exception as e:
                 print(f"[WL Cal] Fit failed: {e}")
 
         elif ch == "4":
+            refs = _cal.get("wl_refs", [])
             print("Refs:")
-            if not _cal.WL_REFS:
+            if not refs:
                 print("  (none)")
             else:
-                for i,r in enumerate(_cal.WL_REFS):
+                for i, r in enumerate(refs):
                     print(f"  {i+1}: θ={r['theta_deg']:.6f}°, λ={r['lambda_nm']} nm, m={r['order_m']}")
-            if _cal.WL_MODEL:
-                a=_cal.WL_MODEL.get("a"); b=_cal.WL_MODEL.get("b")
-                print(f"Model: λ/m ≈ {a:.6f} + {b:.6f}·(2d sinθ)_nm")
+            model = _cal.get("wl_model")
+            if model:
+                print(f"Model: λ/m ≈ {model.get('a',0):.6f} + {model.get('b',1):.6f}·(2d sinθ)_nm")
             else:
                 print("Model: (none) — uses ideal Littrow fallback (a=0, b=1)")
 
@@ -928,7 +961,6 @@ def wl_cal_menu():
             return
         else:
             print("Invalid option.")
-
 
 
 
@@ -1581,7 +1613,14 @@ def position_menu():
                 print("λ must be number, m must be integer."); continue
 
             print("Moving... (press 'q' or Esc to cancel)")
+
+            #using the m*lambda=dsin(theta) function
             _run_cancellable(move_to_wavelength, lam, m, mode=mode)
+
+            #using the m*lambda=d(sin(alpa)+sin(beta)) function
+            #_run_cancellable(move_to_wavelength_nonlinear, lam, m, mode=mode)
+
+
             ok, err = check_step_integrity()
             print(f"Integrity: {'OK' if ok else 'DRIFT'} (Δ={err} steps)  | step_count={step_count}")
 
@@ -1802,7 +1841,6 @@ def _load_optical_offset():
         OPTICAL_HOME_OFFSET_STEPS = 0
 
 
-
 def main():
     global step_delay, S2_STEPS_PER_REV, STEPS_PER_DEG, BACKLASH_STEPS, DIR_REVERSE_SCALE, steps_per_rev, cal
 
@@ -1819,8 +1857,14 @@ def main():
 
 
     # >>> LOAD CALIBRATION <<<
-    cal = load_cal(STATE_DIR)
+    cal = load_cal(STATE_DIR) or {}          # <-- ensure dict
     apply_cal_to_globals(cal, globals())
+
+    # keep a dict-based store in _cal for WL refs/model, etc.
+    global _cal
+    _cal = cal
+    _cal.setdefault("wl_refs", [])
+    _cal.setdefault("wl_model", None)
 
     if "s2_steps_per_rev" in cal:
         S2_STEPS_PER_REV = int(cal["s2_steps_per_rev"])

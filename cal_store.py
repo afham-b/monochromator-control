@@ -130,3 +130,58 @@ def apply_cal_to_globals(cal: Dict[str, Any], g: Dict[str, Any]) -> None:
         g["GRATING_D_MM"] = float(gr["d_mm"])
     if gr.get("theta_zero_deg") is not None:
         g["THETA_ZERO_DEG"] = float(gr["theta_zero_deg"])
+
+
+# ---- Wavelength calibration (stored separately) ----
+# File: state/wavelength_cal.json
+_WL_DEFAULT = {
+    "version": 1,
+    "saved_at": None,
+    "refs": [],              # list of {theta_deg, lambda_nm, order_m}
+    "model": None            # or {"a": float, "b": float}
+}
+
+def _wl_path(state_dir: str) -> str:
+    os.makedirs(state_dir, exist_ok=True)
+    return os.path.join(state_dir, "wavelength_cal.json")
+
+def load_wl_cal(state_dir: str) -> Dict[str, Any]:
+    """Load wavelength refs/model. Always returns dict with defaults merged."""
+    path = _wl_path(state_dir)
+    cal = json.loads(json.dumps(_WL_DEFAULT))  # deep copy
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        # shallow merge
+        for k, v in data.items():
+            if isinstance(v, dict) and k in cal and isinstance(cal[k], dict):
+                cal[k].update(v)
+            else:
+                cal[k] = v
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[cal_store] Could not read {path}: {e} — using defaults")
+    return cal
+
+def save_wl_cal(state_dir: str, *, refs=None, model=None) -> str:
+    """
+    Update any subset of wavelength data and save atomically.
+    refs: list of {theta_deg, lambda_nm, order_m}
+    model: {"a": float, "b": float} or None
+    """
+    path = _wl_path(state_dir)
+    cur = load_wl_cal(state_dir)
+
+    if refs is not None:
+        cur["refs"] = list(refs)
+    if model is not None or model is None:
+        cur["model"] = model
+
+    cur["saved_at"] = time.time()
+
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cur, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    return os.path.abspath(path)
