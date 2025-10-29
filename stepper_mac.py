@@ -1,15 +1,8 @@
 #pip install pyfirmata keyboard
 
-import os
-import logging
-import math
+import os, json, logging, math, time, keyboard, sys, termios
 from datetime import datetime
-
 from pyfirmata import Arduino, util 
-import time
-import keyboard
-import sys
-import termios
 from pynput import keyboard
 
 # used to setup logging and control log file size
@@ -239,18 +232,18 @@ def _fit_littrow_linear(points):
     a = (sumy - b*sumx) / n
     return a, b
 
+
 def _theta_deg_from_lambda(lambda_nm, order_m):
     """
-    Use saved WL model (a,b) if available; otherwise Littrow fallback (a=0, b=1).
+    Use saved WL model (a, b) if available; otherwise fall back to ideal Littrow (a=0,b=1).
     Model: λ/m ≈ a + b * X, where X = (2d sinθ) in nm.
+    Solve for θ: sinθ = ((λ/m - a) / (b * 2d_mm * 1e6)).
     """
-    a, b = 0.0, 1.0
-    try:
-        if WL and WL.get("model"):
-            a = float(WL["model"]["a"])
-            b = float(WL["model"]["b"])
-    except Exception:
-        pass
+    # Always load fresh from the WL store
+    WL = _wl_load(STATE_DIR)
+    model = WL.get("model") or {}
+    a = float(model.get("a", 0.0))
+    b = float(model.get("b", 1.0))
 
     target = (lambda_nm / float(order_m)) - a
     denom = b * (2.0 * GRATING_D_MM * 1e6)  # b * (2d)_nm
@@ -260,6 +253,7 @@ def _theta_deg_from_lambda(lambda_nm, order_m):
     if abs(arg) > 1.0:
         raise ValueError(f"Requested λ={lambda_nm} nm, m={order_m} not reachable (|sinθ|={arg:.6f}>1).")
     return math.degrees(math.asin(arg))
+
 
 
 def calibrate_s2_steps_per_rev(approach_dir=+1):
@@ -390,56 +384,43 @@ def _stage_move_signed(delta_steps):
     # finish at moderate speed
     if remaining > 0:
         move_biased(remaining, EDGE_STEP_DELAY, direction)
+    
 
 def move_to_angle_deg(theta_deg, mode="from_home_ccw"):
     """
     mode:
-      - "from_home_ccw": go_home2() first, then move CCW (+ steps) to target.
-                         If target needs CW (negative steps), you can choose:
-                           (a) allow CW (faster) OR (b) wrap +360° (always CCW).
-                         Below I allow BOTH directions by default; if you want
-                         single-direction-only repeatability, set force_ccw=True.
-      - "shortest": move from current position in whichever direction is shorter.
+      - "from_home_ccw": re-index to Disk Home (repeatable), then move to the
+                         DISK-HOME-relative target that already includes the
+                         saved optical offset.
+      - "shortest": move from current position to the DISK-HOME-relative target
+                    (also includes the saved optical offset) via the shorter arc.
     """
-    # 1) target steps from HOME (m=0)
-    target_steps = angle_to_steps(theta_deg)
+    _ensure_steps_per_deg()
+    target_steps = _target_steps_from_disk_home(theta_deg)  # <-- includes OPTICAL_HOME_OFFSET_STEPS
 
     if mode == "from_home_ccw":
-        # Option A: always start from a repeatable reference
-        go_home2()
-
-        # change this flag to True if you want single-direction approach only:
-        force_ccw = False
-
-        if force_ccw and target_steps < 0:
-            # wrap to positive equivalent (adds one full turn)
-            _ensure_steps_per_deg()
-            target_steps = (target_steps % S2_STEPS_PER_REV)
-
-        _stage_move_signed(target_steps)
-
-        # tiny settle (take out micro-backlash)
-        #move_biased(3, CENTER_STEP_DELAY, +1 if target_steps>=0 else -1)
-        #move_biased(3, CENTER_STEP_DELAY, -1 if target_steps>=0 else +1)
+        # Always begin from a known reference
+        go_home2()  # zeros step_count at Disk Home
+        _stage_move_signed(target_steps)   # move offset+angle in one shot
 
     elif mode == "shortest":
-        # Move from wherever we are now.
-        # We need current "from-home steps"; reuse your step_count (motor axis).
-        # If you prefer reference from S2, you can track a separate "s2_step_count".
-        current_steps_from_home = step_count  # using your convention (CW positive)
-        delta = target_steps - current_steps_from_home
-        # normalize delta to shortest path around a circle if a full 360 wrap is allowed
+        # Compare current Disk-Home-referenced position to Disk-Home-referenced target
+        current = step_count
+        delta = target_steps - current
+
+        # Take the shorter wrap if that’s allowed
         _ensure_steps_per_deg()
         if abs(delta) > S2_STEPS_PER_REV / 2:
-            # take the shorter wrap path
             if delta > 0:
                 delta -= S2_STEPS_PER_REV
             else:
                 delta += S2_STEPS_PER_REV
+
         _stage_move_signed(delta)
 
     else:
         raise ValueError("mode must be 'from_home_ccw' or 'shortest'")
+
 
 #trying litrow with m*lambda = d*(sin(alpha)-sin(beta))
 def move_to_wavelength_nonlinear(lambda_nm, order_m, mode="from_home_ccw"):
@@ -860,15 +841,59 @@ def _ensure_cal_ready():
     _cal.setdefault("wl_model", None)
     return _cal
 
+def _wl_path(state_dir):
+    return os.path.join(state_dir, "wavelength_cal.json")
+
+def _wl_load(state_dir):
+    # prefer your provided cal_store API if available
+    try:
+        return load_wl_cal(state_dir)
+    except Exception:
+        pass
+    # fallback: plain file
+    p = _wl_path(state_dir)
+    if os.path.exists(p):
+        with open(p, "r") as f:
+            return json.load(f)
+    return {"refs": [], "model": None}
+
+def _wl_save(state_dir, refs, model):
+    # prefer your provided cal_store API if available
+    try:
+        save_wl_cal(state_dir, refs=refs, model=model)
+        return
+    except Exception:
+        pass
+    # fallback: plain file
+    p = _wl_path(state_dir)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        json.dump({"refs": refs, "model": model}, f, indent=2, sort_keys=True)
 
 def wl_cal_menu():
-    global WL
+    """
+    Wavelength calibration (single source of truth = wavelength_cal.json)
+      1) Add reference at CURRENT angle θ (uses step_count/STEPS_PER_DEG)
+      2) Add reference by ENTERING θ
+      3) Fit and save model (a, b)            # y = a + bX
+      3z) Fit and save model with a=0 (through origin) # y = bX
+      4) Show current references and model
+      x) Clear ALL refs and model
+      q) Back
+    """
     while True:
+        # Always load fresh from disk to avoid stale in-memory state
+        WL = _wl_load(STATE_DIR)
+        refs = WL.get("refs", [])
+        model = WL.get("model")
+
         print("\n--- Wavelength Calibration ---")
         print("1) Add reference using CURRENT angle θ")
         print("2) Add reference by ENTERING angle θ")
         print("3) Fit and save model (a,b)")
+        print("3z) Fit and save model with a=0 (through origin)")
         print("4) Show current references and model")
+        print("x) Clear ALL wavelength refs and model (reset)")
         print("q) Back")
         ch = input("Select: ").strip().lower()
 
@@ -877,14 +902,13 @@ def wl_cal_menu():
                 lam = float(input("λ (nm): ").strip())
                 m   = int(input("order m (integer, nonzero): ").strip())
             except Exception:
-                print("Invalid λ or m."); continue
+                print("Invalid λ or m.")
+                continue
+
             _ensure_steps_per_deg()
             theta_now = step_count / STEPS_PER_DEG
-            # update WL
-            refs = list(WL.get("refs", []))
-            refs.append({"theta_deg": theta_now, "lambda_nm": lam, "order_m": m})
-            WL["refs"] = refs
-            save_wl_cal(STATE_DIR, refs=WL["refs"], model=WL.get("model"))
+            refs.append({"theta_deg": float(theta_now), "lambda_nm": lam, "order_m": int(m)})
+            _wl_save(STATE_DIR, refs, model)
             print(f"[WL Cal] Added ref: θ={theta_now:.6f}°, λ={lam} nm, m={m}")
 
         elif ch == "2":
@@ -893,41 +917,100 @@ def wl_cal_menu():
                 lam   = float(input("λ (nm): ").strip())
                 m     = int(input("order m (integer, nonzero): ").strip())
             except Exception:
-                print("Invalid entry."); continue
-            refs = list(WL.get("refs", []))
-            refs.append({"theta_deg": theta, "lambda_nm": lam, "order_m": m})
-            WL["refs"] = refs
-            save_wl_cal(STATE_DIR, refs=WL["refs"], model=WL.get("model"))
+                print("Invalid entry.")
+                continue
+            refs.append({"theta_deg": float(theta), "lambda_nm": lam, "order_m": int(m)})
+            _wl_save(STATE_DIR, refs, model)
             print(f"[WL Cal] Added ref: θ={theta:.6f}°, λ={lam} nm, m={m}")
 
-        elif ch == "3":
+        elif ch == "3" or ch == "3z":
             try:
-                a, b = _fit_littrow_linear(WL.get("refs", []))
-                WL["model"] = {"a": a, "b": b}
-                save_wl_cal(STATE_DIR, refs=WL.get("refs", []), model=WL["model"])
-                print(f"[WL Cal] Fit done. a={a:.6f}, b={b:.6f}  (λ/m ≈ a + b·(2d sinθ)_nm)")
+                # Build X = (2d sinθ)_nm and Y = λ/m, skipping m=0
+                X, Y = [], []
+                for p in refs:
+                    m = float(p["order_m"])
+                    if m == 0:
+                        continue
+                    x_nm = _deg_to_littrow_term(float(p["theta_deg"]))  # already returns in nm
+                    X.append(x_nm)
+                    Y.append(float(p["lambda_nm"]) / m)
+
+                if len(X) < 2 and ch == "3":
+                    raise ValueError("Need at least two refs with m≠0 for a free (a,b) fit.")
+                if len(X) < 1 and ch == "3z":
+                    raise ValueError("Need at least one ref with m≠0 for a through-origin fit.")
+
+                if ch == "3z":
+                    # Through-origin: minimize sum (Y - bX)^2 -> b = sum(XY)/sum(XX)
+                    sumxx = sum(x*x for x in X)
+                    sumxy = sum(x*y for x, y in zip(X, Y))
+                    if abs(sumxx) < 1e-12:
+                        raise ValueError("Degenerate through-origin fit (sumxx≈0).")
+                    a = 0.0
+                    b = sumxy / sumxx
+                else:
+                    # Regular linear fit y = a + bX
+                    n = len(X)
+                    sumx = sum(X); sumy = sum(Y)
+                    sumxx = sum(x*x for x in X)
+                    sumxy = sum(x*y for x, y in zip(X, Y))
+                    denom = n*sumxx - sumx*sumx
+                    if abs(denom) < 1e-9:
+                        raise ValueError("Degenerate fit (denominator≈0).")
+                    b = (n*sumxy - sumx*sumy) / denom
+                    a = (sumy - b*sumx) / n
+
+                model = {"a": float(a), "b": float(b)}
+                _wl_save(STATE_DIR, refs, model)
+                print(f"[WL Cal] Fit saved. a={a:.6f}, b={b:.6f}   (λ/m ≈ a + b·(2d sinθ)_nm)")
+
+                # Also scrub any legacy in-memory copies so they don't “come back”
+                try:
+                    if isinstance(_cal, dict):
+                        _cal.pop("wl_refs", None)
+                        _cal.pop("wl_model", None)
+                except Exception:
+                    pass
+
             except Exception as e:
                 print(f"[WL Cal] Fit failed: {e}")
 
         elif ch == "4":
-            refs = WL.get("refs", [])
             print("Refs:")
             if not refs:
                 print("  (none)")
             else:
                 for i, r in enumerate(refs):
                     print(f"  {i+1}: θ={r['theta_deg']:.6f}°, λ={r['lambda_nm']} nm, m={r['order_m']}")
-            model = WL.get("model")
             if model:
                 print(f"Model: λ/m ≈ {model.get('a',0):.6f} + {model.get('b',1):.6f}·(2d sinθ)_nm")
             else:
-                print("Model: (none) — using Littrow fallback (a=0, b=1)")
+                print("Model: (none) — ideal Littrow fallback (a=0, b=1)")
+
+        elif ch == "x":
+            confirm = input("Clear ALL wavelength refs and model? (y/q): ").strip().lower()
+            if confirm != "y":
+                print("Clear cancelled.")
+                continue
+
+            # Reset WL file
+            refs = []
+            model = None
+            _wl_save(STATE_DIR, refs, model)
+            print("[WL Cal] Cleared refs and model (wavelength_cal.json).")
+
+            # Also nuke legacy fields in _cal so they can't re-populate the UI
+            try:
+                if isinstance(_cal, dict):
+                    _cal.pop("wl_refs", None)
+                    _cal.pop("wl_model", None)
+            except Exception:
+                pass
 
         elif ch == "q":
             return
         else:
             print("Invalid option.")
-
 
 
 def jog_mode2(step_delay):
@@ -1251,6 +1334,16 @@ def go_home2():
     _persist_step_count()
 
 
+#helper functions for optical home offset to be added to the position menu's wavelength to step calculation
+def _target_steps_from_disk_home(theta_deg: float) -> int:
+    """
+    Convert desired grating angle to steps, referenced to DISK HOME,
+    by adding the saved optical-home offset.
+    """
+    _ensure_steps_per_deg()
+    base = angle_to_steps(theta_deg)                 # your existing sign convention
+    return int(round(OPTICAL_HOME_OFFSET_STEPS + base))
+
 
 def go_optical_home():
     """
@@ -1512,6 +1605,7 @@ def position_menu():
         print("3) Move to wavelength λ (nm) & order m")
         print("4) Show current S2 steps/deg and integrity check")
         print("5) Wavelength calibration (refs & fit)") 
+        print("x) Clear ALL wavelength refs and model (reset)")
         print("Q) Back to main menu")
 
         choice = input("Select: ").strip().lower()
@@ -1568,10 +1662,10 @@ def position_menu():
             print("Moving... (press 'q' or Esc to cancel)")
 
             #using the m*lambda=dsin(theta) function
-            _run_cancellable(move_to_wavelength, lam, m, mode=mode)
+            #_run_cancellable(move_to_wavelength, lam, m, mode=mode)
 
             #using the m*lambda=d(sin(alpa)+sin(beta)) function
-            #_run_cancellable(move_to_wavelength_nonlinear, lam, m, mode=mode)
+            _run_cancellable(move_to_wavelength_nonlinear, lam, m, mode=mode)
 
 
             ok, err = check_step_integrity()
@@ -1585,6 +1679,23 @@ def position_menu():
 
         elif choice == "5":
             wl_cal_menu()
+
+        elif choice == "x" or choice == "X":
+            print("Clearing ALL wavelength calibration references and model... Are you sure? y = yes /q = quit")
+            confirm = input("Confirm (y/q): ").strip().lower()
+            if confirm != 'y':
+                print("Clear cancelled.")
+                continue    
+            if confirm == 'y':
+                _ensure_cal_ready()
+                _cal["wl_refs"] = []
+                _cal["wl_model"] = None
+                try:
+                    # If you have these (some versions do)
+                    save_wl_cal(STATE_DIR, refs=[], model=None)
+                except Exception:
+                    pass
+                print("[WL Cal] Cleared all refs and model.")
 
         elif choice in ("q", "Q"):
             print("Leaving Position menu.")
@@ -1889,6 +2000,5 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
 # try 587.5 nm at m=1, 686.7, 501.5 nm
