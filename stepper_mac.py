@@ -362,7 +362,7 @@ def _ensure_steps_per_deg():
 
 def angle_to_steps(theta_deg):
     _ensure_steps_per_deg()
-    direction = -1 #if CW is positive and 1 if CW is negative
+    direction = 1 #if CW is positive and -1 if CW is negative
     steps = int(round(direction*theta_deg * STEPS_PER_DEG))
     return steps
 
@@ -870,17 +870,67 @@ def _wl_save(state_dir, refs, model):
     with open(p, "w") as f:
         json.dump({"refs": refs, "model": model}, f, indent=2, sort_keys=True)
 
+def restore_wl_from_backup():
+    """
+    Restore wavelength refs/model from state/wavelength_cal_backup.json.
+    Updates _cal and WL (if present) and persists via _wl_save(refs, model).
+    Falls back to writing state/wavelength_cal.json directly if _wl_save fails.
+    """
+    global _cal, WL
+    _ensure_cal_ready()
+
+    backup_path = os.path.join(STATE_DIR, "wavelength_cal_backup.json")
+    target_path = os.path.join(STATE_DIR, "wavelength_cal.json")
+
+    try:
+        with open(backup_path, "r") as f:
+            data = json.load(f)
+
+        refs = data.get("refs", [])
+        model = data.get("model")
+
+        if not isinstance(refs, list):
+            raise ValueError("backup 'refs' must be a list")
+        if model is not None and not isinstance(model, dict):
+            raise ValueError("backup 'model' must be an object or null")
+
+        # Update in-memory store
+        _cal["wl_refs"] = refs
+        _cal["wl_model"] = model
+
+        # Mirror legacy WL dict if present
+        try:
+            if isinstance(WL, dict):
+                WL["refs"] = list(refs)
+                WL["model"] = dict(model) if isinstance(model, dict) else None
+        except Exception:
+            pass
+
+        # Persist using your helper (positional args!)
+        try:
+            _wl_save(refs, model)           # <-- IMPORTANT: positional, not kwargs
+        except Exception:
+            # Hard fallback: write the JSON directly
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(target_path, "w") as out:
+                json.dump({
+                    "version": data.get("version", 1),
+                    "saved_at": time.time(),
+                    "refs": refs,
+                    "model": model
+                }, out, indent=2, sort_keys=True)
+
+        a = model.get("a", 0.0) if isinstance(model, dict) else 0.0
+        b = model.get("b", 1.0) if isinstance(model, dict) else 1.0
+        print(f"[WL Cal] Restored {len(refs)} refs; model: a={a:.6f}, b={b:.6f} from {backup_path}")
+
+    except FileNotFoundError:
+        print(f"[WL Cal] Backup not found: {backup_path}")
+    except Exception as e:
+        print(f"[WL Cal] Restore failed: {e}")
+
+
 def wl_cal_menu():
-    """
-    Wavelength calibration (single source of truth = wavelength_cal.json)
-      1) Add reference at CURRENT angle θ (uses step_count/STEPS_PER_DEG)
-      2) Add reference by ENTERING θ
-      3) Fit and save model (a, b)            # y = a + bX
-      3z) Fit and save model with a=0 (through origin) # y = bX
-      4) Show current references and model
-      x) Clear ALL refs and model
-      q) Back
-    """
     while True:
         # Always load fresh from disk to avoid stale in-memory state
         WL = _wl_load(STATE_DIR)
@@ -893,6 +943,8 @@ def wl_cal_menu():
         print("3) Fit and save model (a,b)")
         print("3z) Fit and save model with a=0 (through origin)")
         print("4) Show current references and model")
+        print("5) Used Backup model")
+        print("J) Jog Mode")
         print("x) Clear ALL wavelength refs and model (reset)")
         print("q) Back")
         ch = input("Select: ").strip().lower()
@@ -986,6 +1038,16 @@ def wl_cal_menu():
                 print(f"Model: λ/m ≈ {model.get('a',0):.6f} + {model.get('b',1):.6f}·(2d sinθ)_nm")
             else:
                 print("Model: (none) — ideal Littrow fallback (a=0, b=1)")
+
+        elif ch == "5":
+            # Load backup model from cal_store if available
+            try:
+                restore_wl_from_backup()
+            except Exception as e:
+                print(f"[WL Cal] Could not load backup model: {e}")
+
+        elif ch == "j":
+            jog_mode2(step_delay=0.005)
 
         elif ch == "x":
             confirm = input("Clear ALL wavelength refs and model? (y/q): ").strip().lower()
@@ -1605,7 +1667,8 @@ def position_menu():
         print("3) Move to wavelength λ (nm) & order m")
         print("4) Show current S2 steps/deg and integrity check")
         print("5) Wavelength calibration (refs & fit)") 
-        print("x) Clear ALL wavelength refs and model (reset)")
+        print("J) Jog mode (hold UP/DOWN to move)")
+        print("H) Go Home")
         print("Q) Back to main menu")
 
         choice = input("Select: ").strip().lower()
@@ -1680,22 +1743,12 @@ def position_menu():
         elif choice == "5":
             wl_cal_menu()
 
-        elif choice == "x" or choice == "X":
-            print("Clearing ALL wavelength calibration references and model... Are you sure? y = yes /q = quit")
-            confirm = input("Confirm (y/q): ").strip().lower()
-            if confirm != 'y':
-                print("Clear cancelled.")
-                continue    
-            if confirm == 'y':
-                _ensure_cal_ready()
-                _cal["wl_refs"] = []
-                _cal["wl_model"] = None
-                try:
-                    # If you have these (some versions do)
-                    save_wl_cal(STATE_DIR, refs=[], model=None)
-                except Exception:
-                    pass
-                print("[WL Cal] Cleared all refs and model.")
+        elif choice in ("j", "J"):
+            jog_mode2(step_delay)   
+            # returns here when you quit Jog
+
+        elif choice in ("h", "H"):
+            _run_cancellable(go_optical_home) 
 
         elif choice in ("q", "Q"):
             print("Leaving Position menu.")
