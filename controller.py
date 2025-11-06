@@ -1,27 +1,98 @@
-#pip install pyfirmata keyboard
+#py -m pip install pyfirmata pynput pyserial
+# (optional) py -m pip install keyboard
 
-import os, json, logging, math, time, keyboard, sys, termios
+#windows may need this in terminal: setx ARDUINO_PORT COM5
+
+
+import os, sys, time, math, logging, platform, json
 from datetime import datetime
-from pyfirmata import Arduino, util 
-from pynput import keyboard
+from pyfirmata import Arduino, util
+
+try:
+    import keyboard as kb  # optionals
+except Exception:
+    kb = None
+
+try:
+    from pynput import keyboard as pynput_keyboard
+except Exception as e:
+    print("Failed to import pynput.keyboard. Install with: pip install pynput")
+    raise
 
 # used to setup logging and control log file size
 from log_utils import TailTruncatingFileHandler, enforce_log_size_limit
 
-
-#windows
-# try:
-#     board = Arduino('COM10')  # Set your Arduino port here
-# except Exception as e:
-#     print(f"Arduino initialization failed: {e}")
-#     sys.exit(1)
-
-#mac, open terminal and type this for com number ls /dev/tty.*
+# Serial port discovery (pyserial comes with pyfirmata, but import tools explicitly)
 try:
-    board = Arduino('/dev/cu.usbmodem1101')
+    from serial.tools import list_ports
+except Exception:
+    list_ports = None  # we’ll still try known defaults if tools aren’t present
+
+# Cross-platform input flushing
+if platform.system() == "Windows":
+    # No termios on Windows; define a no-op
+    def flush_input():
+        # Windows console input isn’t line-buffered the same way; nothing to flush.
+        return
+else:
+    import termios
+    def flush_input():
+        # POSIX: flush stdin
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+def _pick_arduino_port(preferred=None):
+    """
+    Return a serial port string for the Arduino on macOS or Windows.
+    - If 'preferred' is provided, try it first.
+    - Otherwise scan available ports and pick the most Arduino-looking one.
+    """
+    # If caller passes an explicit port, try that first
+    if preferred:
+        return preferred
+
+    # If we can't scan, fall back to sensible defaults
+    if list_ports is None:
+        return "COM10" if platform.system() == "Windows" else "/dev/cu.usbmodem1101"
+
+    candidates = list(list_ports.comports())
+    if not candidates:
+        # No ports found; fall back
+        return "COM10" if platform.system() == "Windows" else "/dev/cu.usbmodem1101"
+
+    # Heuristics: prefer ports whose descriptions mention Arduino/USB/Modem
+    def score(p):
+        desc = f"{p.description or ''} {p.manufacturer or ''}".lower()
+        s = 0
+        if "arduino" in desc: s += 10
+        if "usb" in desc:     s += 3
+        if "modem" in desc:   s += 2
+        if platform.system() == "Windows" and p.device.upper().startswith("COM"):
+            s += 1
+        if platform.system() != "Windows" and "/dev/cu." in p.device:
+            s += 1
+        return s
+
+    best = max(candidates, key=score)
+    return best.device
+
+# --- Board init (cross-platform) ---
+PORT_OVERRIDE = os.getenv("ARDUINO_PORT")  # allow manual override via env var
+port = _pick_arduino_port(PORT_OVERRIDE)
+
+try:
+    board = Arduino(port)
 except Exception as e:
-    print(f"Arduino initialization failed: {e}")
+    print(f"Arduino initialization failed on port '{port}': {e}")
+    print("Tips:")
+    print("  • Check the correct COM port (Windows) or /dev/cu.* (macOS).")
+    print("  • Try setting ARDUINO_PORT env var, e.g. ARDUINO_PORT=COM5")
+    print("  • Ensure drivers/permissions are OK (Device Manager on Windows; 'ls /dev/cu.*' on macOS).")
     sys.exit(1)
+
+it = util.Iterator(board)
+it.start()
+time.sleep(1)  # let board settle
+
 
 pins = [11, 10, 9, 8]  # IN1–IN4 pins on ULN2003
 
@@ -29,10 +100,6 @@ pins = [11, 10, 9, 8]  # IN1–IN4 pins on ULN2003
 optical_pin = 7
 #second optical switch
 optical_pin2 = 5
-
-# Start the iterator to receive input from the board
-it = util.Iterator(board)
-it.start()
 
 # Set up pin 7 as input
 board.digital[optical_pin].mode = 0  # 0 means INPUT
@@ -117,14 +184,14 @@ OPTICAL_HOME_OFFSET_STEPS = 0  # +CW, -CCW (relative to Disk Home)
 GRATING_D_MM = 1.0 / 1200.0   # groove spacing in mm for 1200 lines/mm
 
 # S2 rotation calibration storage
-S2_STEPS_PER_REV = 17971  # measured later; fallback computed if missing
+S2_STEPS_PER_REV = 18000  # measured later; fallback computed if missing
 STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0     # derived (S2_STEPS_PER_REV / 360)
 
 # Fallback (from your notes: 205 revs + 40 steps for one S2 360°)
 #   revs_per_rotation = motor-shaft revs (S1) per one S2 revolution
 #   steps_per_rev      = motor steps per one S1 revolution
 def _s2_steps_fallback():
-    return revs_per_rotation * steps_per_rev + delta_steps
+    return S2_STEPS_PER_REV
 
 # grabbing calibration data from cal_store.py if available
 try:
@@ -158,29 +225,70 @@ seq = [
 step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
 
-def _apply_cal_to_runtime():
-    """
-    Copy values from _cal into the globals the motion code uses.
-    Safe to call multiple times.
-    """
-    global S2_STEPS_PER_REV, STEPS_PER_DEG
-    global BACKLASH_STEPS, DIR_REVERSE_SCALE, HOME_OFFSET_DIR
+def jog_mode2(step_delay):
+    print("\n--- Jog Mode ---")
+    print("Hold UP for forward, DOWN for reverse. Press Q to quit jog mode.")
 
-    if _cal is None:
-        return
+    running = True
+    forward_pressed = False
+    reverse_pressed = False
 
-    if _cal.S2_STEPS_PER_REV:
-        S2_STEPS_PER_REV = _cal.S2_STEPS_PER_REV
-        STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0
+    def on_press(key):
+        nonlocal running, forward_pressed, reverse_pressed
+        if key == pynput_keyboard.Key.up:
+            forward_pressed = True
+        elif key == pynput_keyboard.Key.down:
+            reverse_pressed = True
+        elif hasattr(key, 'char') and key.char and key.char.lower() == 'q':
+            running = False
+            print("Exiting jog mode.")
+            print("step count", step_count)
+            print("rev count", rev_count)
+            return False
 
-    if _cal.HOME_OFFSET_DIR:
-        HOME_OFFSET_DIR = dict(_cal.HOME_OFFSET_DIR)
+    def on_release(key):
+        nonlocal forward_pressed, reverse_pressed
+        if key == pynput_keyboard.Key.up:
+            forward_pressed = False
+        elif key == pynput_keyboard.Key.down:
+            reverse_pressed = False
 
-    if _cal.BACKLASH_STEPS is not None:
-        BACKLASH_STEPS = int(_cal.BACKLASH_STEPS)
+    listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
 
-    if _cal.DIR_REVERSE_SCALE is not None:
-        DIR_REVERSE_SCALE = float(_cal.DIR_REVERSE_SCALE)
+    try:
+        while running:
+            #step_delay = 0.001  # responsive fixed delay
+            if forward_pressed:
+                move_biased(steps=1, step_delay=step_delay, direction=1)
+                while forward_pressed and running:
+                    move_biased(steps=1, step_delay=step_delay, direction=1)
+
+            if reverse_pressed:
+                move_biased(steps=1, step_delay=step_delay, direction=-1)
+                while reverse_pressed and running:
+                    move_biased(steps=1, step_delay=step_delay, direction=-1)
+
+            monitor_sensors()
+            time.sleep(0.01)
+    finally:
+        listener.stop()
+def _start_cancel_listener(hint="Press 'q' or Esc to cancel and return to the main menu."):
+    print(hint)
+    _set_cancel(False)
+
+    def on_press(key):
+        try:
+            if key == pynput_keyboard.Key.esc:
+                _set_cancel(True); return False
+            if hasattr(key, "char") and key.char and key.char.lower() == 'q':
+                _set_cancel(True); return False
+        except Exception:
+            pass
+
+    listener = pynput_keyboard.Listener(on_press=on_press)
+    listener.start()
+    return listener
 
 
 def wavelength_to_theta_deg(lambda_nm, order_m, d_mm=GRATING_D_MM):
@@ -313,23 +421,6 @@ def _check_cancel():
     if CANCEL:
         raise _QuitToMain
 
-def _start_cancel_listener(hint="Press 'q' or Esc to cancel and return to the main menu."):
-    print(hint)
-    _set_cancel(False)
-
-    def on_press(key):
-        try:
-            if key == keyboard.Key.esc:
-                _set_cancel(True); return False
-            if hasattr(key, "char") and key.char and key.char.lower() == 'q':
-                _set_cancel(True); return False
-        except Exception:
-            pass  # never let listener crash
-
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-    return listener
-
 def _stop_cancel_listener(listener):
     try:
         if listener: listener.stop()
@@ -365,25 +456,6 @@ def angle_to_steps(theta_deg):
     direction = 1 #if CW is positive and -1 if CW is negative
     steps = int(round(direction*theta_deg * STEPS_PER_DEG))
     return steps
-
-def _stage_move_signed(delta_steps):
-    """
-    Signed move with a fast pre-roll when far, then slower finishing.
-    """
-    if delta_steps == 0:
-        return
-    direction = 1 if delta_steps > 0 else -1
-    remaining = abs(delta_steps)
-
-    # fast chunk
-    if remaining > FAR_STEP_THRESHOLD_MOVE:
-        fast_chunk = remaining - FAR_STEP_THRESHOLD_MOVE
-        move_biased(fast_chunk, FAST_STEP_DELAY, direction)
-        remaining -= fast_chunk
-
-    # finish at moderate speed
-    if remaining > 0:
-        move_biased(remaining, EDGE_STEP_DELAY, direction)
     
 
 def move_to_angle_deg(theta_deg, mode="from_home_ccw"):
@@ -475,25 +547,21 @@ def move_biased(steps, step_delay, direction):
             # letting them count is fine.
             move_stepper(seq, BACKLASH_STEPS, step_delay, direction)
 
-    # Scale reverse steps for steady-state bias
     adj_steps = steps
     if direction == -1 and DIR_REVERSE_SCALE != 1.0:
-        # Keep fractional error small via accumulator
-        _rev_scale_err_accum += steps * DIR_REVERSE_SCALE
-        adj_steps = int(round(_rev_scale_err_accum))
-        _rev_scale_err_accum -= adj_steps
-
-        # Ensure at least one step if nonzero commanded
-        if steps > 0 and adj_steps == 0:
-            adj_steps = 1
+        # accumulate only the *extra* steps from scaling
+        _rev_scale_err_accum += steps * (DIR_REVERSE_SCALE - 1.0)
+        extra = int(round(_rev_scale_err_accum))
+        _rev_scale_err_accum -= extra
+        adj_steps = steps + max(0, extra)
 
     move_stepper(seq, adj_steps, step_delay, direction)
     _last_move_dir = direction
     _check_cancel() 
 
-
 def move_stepper(seq, steps,step_delay, direction):
-    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, home, switch1, switch2, steps_per_rev, steps_till_rev, steps_since_rev, is_1rev_completed
+    global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, _steps_since_any_edge
+    global home, switch1, switch2, steps_per_rev, steps_till_rev, steps_since_rev, is_1rev_completed
     # do NOT reinitialize them here!
     # just update their values as you go
 
@@ -532,15 +600,20 @@ def move_stepper(seq, steps,step_delay, direction):
                         transition_sequence.pop(0)
 
                     # Check for open->blocked->open
-                    if transition_sequence == ["OPEN", "BLOCKED", "OPEN"]:
+                    #if transition_sequence == ["OPEN", "BLOCKED", "OPEN"]:
+                    if transition_sequence == ["OPEN", "BLOCKED", "OPEN"] and abs(_steps_since_any_edge) >= EDGE_HOLDOFF_STEPS:
                          #if steps_since_rev > steps_per_rev * 0.8:  # Assuming at least 80% of expected steps before counting a rev
                         rev_count += 1 * direction
                         is_1rev_completed = True
                         steps_since_rev = 0
+                        _steps_since_any_edge = 0
                         transition_sequence = ["OPEN"] # reset for next revolution
+
 
             last_switch1_state = state1
             time.sleep(step_delay)
+        
+        _steps_since_any_edge += 1 if direction > 0 else -1  # signed ok; we use abs()
 
         step_count += 1*direction  # After one complete seq, count as one step
 
@@ -581,46 +654,6 @@ def set_speed(current_delay):
             return new_delay
         except ValueError:
             print("Invalid input. Enter a number.")
-
-def jog_mode(step_delay):
-    global step_count, rev_count, home
-
-    print("\n--- Jog Mode ---")
-    print("Hold UP for forward CW, DOWN for reverse CCW. Press Q to quit jog mode.")
-    time.sleep(2)
-    try:
-        while True:
-            if keyboard.is_pressed('q'):
-                print("Exiting jog mode.\n")
-                break
-            elif keyboard.is_pressed('up'):
-                #move_stepper(seq, steps=1, step_delay =0.001, direction= 1)
-                move_biased(steps = 1, step_delay=0.001, direction=1)
-                 #for testing    
-                print("step count", step_count)
-                print("rev count", rev_count)
-
-            elif keyboard.is_pressed('down'):
-                # Move one step in reverse
-                #move_stepper(seq, steps =1, step_delay =0.001, direction= -1)
-                move_biased(steps =1, step_delay=0.001, direction=-1)
-                 #for testing    
-                print("step count", step_count)
-                print("rev count", rev_count)
-            else:
-                # Release all pins to stop holding torque
-                for pin in pins:
-                    board.digital[pin].write(0)
-                time.sleep(0.01)
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        for pin in pins:
-            board.digital[pin].write(0)
-
-def flush_input():
-    termios.tcflush(sys.stdin, termios.TCIFLUSH)
 
 def _sensor_state(pin):
     #Return True if BLOCKED, False if OPEN (None treated as last seen).
@@ -823,7 +856,7 @@ def calibration():
             result = calibrate_directional_bias(pin=optical_pin, approach_dir=+1, verbose=True)
 
 
-        elif choice == 'q' or 'Q':
+        elif choice.lower() == 'q':
             print("Exiting calibration menu.\n")
             return
 
@@ -908,17 +941,17 @@ def restore_wl_from_backup():
 
         # Persist using your helper (positional args!)
         try:
-            _wl_save(refs, model)           # <-- IMPORTANT: positional, not kwargs
+            _wl_save(STATE_DIR, refs, model)           # <-- IMPORTANT: positional, not kwargs
         except Exception:
-            # Hard fallback: write the JSON directly
-            os.makedirs(STATE_DIR, exist_ok=True)
-            with open(target_path, "w") as out:
-                json.dump({
-                    "version": data.get("version", 1),
-                    "saved_at": time.time(),
-                    "refs": refs,
-                    "model": model
-                }, out, indent=2, sort_keys=True)
+             # Hard fallback: write the JSON directly
+                os.makedirs(STATE_DIR, exist_ok=True)
+                with open(target_path, "w") as out:
+                    json.dump({
+                        "version": data.get("version", 1),
+                        "saved_at": time.time(),
+                        "refs": refs,
+                        "model": model
+                    }, out, indent=2, sort_keys=True)
 
         a = model.get("a", 0.0) if isinstance(model, dict) else 0.0
         b = model.get("b", 1.0) if isinstance(model, dict) else 1.0
@@ -943,7 +976,7 @@ def wl_cal_menu():
         print("3) Fit and save model (a,b)")
         print("3z) Fit and save model with a=0 (through origin)")
         print("4) Show current references and model")
-        print("5) Used Backup model")
+        print("5) Use Backup model")
         print("J) Jog Mode")
         print("x) Clear ALL wavelength refs and model (reset)")
         print("q) Back")
@@ -1074,58 +1107,6 @@ def wl_cal_menu():
         else:
             print("Invalid option.")
 
-
-def jog_mode2(step_delay):
-    print("\n--- Jog Mode ---")
-    print("Hold UP for forward, DOWN for reverse. Press Q to quit jog mode.")
-
-    running = True
-    forward_pressed = False
-    reverse_pressed = False
-
-    def on_press(key):
-        nonlocal running, forward_pressed, reverse_pressed
-        if key == keyboard.Key.up:
-            forward_pressed = True
-        elif key == keyboard.Key.down:
-            reverse_pressed = True
-        elif hasattr(key, 'char') and key.char and key.char.lower() == 'q':
-            running = False
-            print("Exiting jog mode.")   
-            print("step count", step_count)
-            print("rev count", rev_count)
-            return False
-
-    def on_release(key):
-        nonlocal forward_pressed, reverse_pressed
-        if key == keyboard.Key.up:
-            forward_pressed = False
-        elif key == keyboard.Key.down:
-            reverse_pressed = False
-
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.start()
-
-    while running:
-        step_delay = 0.001  # Set a fixed step delay for responsiveness
-        if forward_pressed:
-            #move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
-            move_biased(steps =1, step_delay=step_delay, direction=1)
-            while forward_pressed:
-                #move_stepper(seq, steps=1, step_delay=step_delay, direction=1)
-                move_biased(steps =1, step_delay=step_delay, direction=1)
-
-        if reverse_pressed:
-            #move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
-            move_biased(steps =1, step_delay=step_delay, direction=-1)
-            while reverse_pressed:
-                #move_stepper(seq, steps=1, step_delay=step_delay, direction=-1)
-                move_biased(steps =1, step_delay=step_delay, direction=-1)
-
-        monitor_sensors()
-        time.sleep(0.01)  # Adjust for responsiveness/smoothness
-
-    listener.stop()
 
 def monitor_sensors():
     global step_count, rev_count, switch1, switch2, last_states, home 
@@ -1443,15 +1424,15 @@ def find_optical_home_offset():
         nonlocal running, session_offset
         global OPTICAL_HOME_OFFSET_STEPS     # ← IMPORTANT: write to the real global
         try:
-            if key == keyboard.Key.up:
+            if key == pynput_keyboard.Key.up:
                 _nudge(+1)
-            elif key == keyboard.Key.down:
+            elif key == pynput_keyboard.Key.down:
                 _nudge(-1)
-            elif key == keyboard.Key.page_up:
+            elif key == pynput_keyboard.Key.page_up:
                 _nudge(+10)
-            elif key == keyboard.Key.page_down:
+            elif key == pynput_keyboard.Key.page_down:
                 _nudge(-10)
-            elif key == keyboard.Key.enter or (hasattr(key, "char") and key.char and key.char.lower() == 's'):
+            elif key == pynput_keyboard.Key.enter or (hasattr(key, "char") and key.char and key.char.lower() == 's'):
                 # Save & exit
                 OPTICAL_HOME_OFFSET_STEPS = session_offset
                 _persist_optical_offset()
@@ -1464,7 +1445,7 @@ def find_optical_home_offset():
                     print(f"[Saved] Offset persisted, but readback failed: {e}")
                 running = False
                 return False
-            elif key == keyboard.Key.esc or (hasattr(key, "char") and key.char and key.char.lower() == 'q'):
+            elif key == pynput_keyboard.Key.esc or (hasattr(key, "char") and key.char and key.char.lower() == 'q'):
                 print("[Cancel] Leaving offset unchanged.")
                 running = False
                 return False
@@ -1475,7 +1456,7 @@ def find_optical_home_offset():
         except Exception as e:
             print(f"[Listener] {e}")
 
-    listener = keyboard.Listener(on_press=on_press)
+    listener = pynput_keyboard.Listener(on_press=on_press)
     listener.start()
     try:
         while running:
@@ -1588,7 +1569,8 @@ def go_home():
 
 
 def set_home():
-    global home_delta_steps, home_revs, home_steps, home_pre_rev_steps, step_count, rev_count, delta_steps, home, steps_till_rev, last_switch1_state, last_switch2_state , transition_sequence
+    global home_delta_steps, home_revs, home_steps, home_pre_rev_steps, step_count, rev_count, delta_steps, home
+    global steps_till_rev, last_switch1_state, last_switch2_state , transition_sequence, steps_since_rev
     print("Please use jog mode to set worm gear to home (switch 2 open) quit jog mode.")
     time.sleep(3)
     jog_mode2(step_delay=0.001)
@@ -1778,6 +1760,7 @@ def _stage_move_signed(delta_steps):
     # finish at moderate speed
     if remaining > 0:
         move_biased(remaining, EDGE_STEP_DELAY, direction)
+
 
 # --- Quick quit-from-any-prompt plumbing ---
 class _QuitToMain(Exception):
