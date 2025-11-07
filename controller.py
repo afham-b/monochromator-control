@@ -555,7 +555,9 @@ def move_biased(steps, step_delay, direction):
         _rev_scale_err_accum -= extra
         adj_steps = steps + max(0, extra)
 
-    move_stepper(seq, adj_steps, step_delay, direction)
+    if adj_steps > 0:
+        move_stepper(seq, adj_steps, step_delay, direction)
+        
     _last_move_dir = direction
     _check_cancel() 
 
@@ -614,9 +616,7 @@ def move_stepper(seq, steps,step_delay, direction):
             time.sleep(step_delay)
         
         _steps_since_any_edge += 1 if direction > 0 else -1  # signed ok; we use abs()
-
         step_count += 1*direction  # After one complete seq, count as one step
-
         steps_since_rev += 1*direction
 
         #add persistence per step, remove if run time increases too much 
