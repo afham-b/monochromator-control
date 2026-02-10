@@ -542,9 +542,7 @@ def move_biased(steps, step_delay, direction):
     # If direction changes, take up backlash in the new direction first.
     if _last_move_dir is not None and direction != _last_move_dir:
         if BACKLASH_STEPS > 0:
-            # Take up slack. These are "compensation" steps; you can treat them
-            # as physical-only, but since your counters track actual motion,
-            # letting them count is fine.
+            # Take up slack. These are "compensation" steps
             move_stepper(seq, BACKLASH_STEPS, step_delay, direction)
 
     adj_steps = steps
@@ -991,7 +989,8 @@ def wl_cal_menu():
                 continue
 
             _ensure_steps_per_deg()
-            theta_now = step_count / STEPS_PER_DEG
+            theta_now = (step_count - OPTICAL_HOME_OFFSET_STEPS) / STEPS_PER_DEG
+
             refs.append({"theta_deg": float(theta_now), "lambda_nm": lam, "order_m": int(m)})
             _wl_save(STATE_DIR, refs, model)
             print(f"[WL Cal] Added ref: θ={theta_now:.6f}°, λ={lam} nm, m={m}")
@@ -1982,7 +1981,12 @@ def main():
     else:
         print(f"[Cal] Loaded: S2_STEPS_PER_REV={S2_STEPS_PER_REV}, STEPS_PER_DEG={STEPS_PER_DEG:.6f}, "
               f"BACKLASH={BACKLASH_STEPS}, REVERSE_SCALE={DIR_REVERSE_SCALE}")
-
+        
+    MAX_REASONABLE = 10 * S2_STEPS_PER_REV  # e.g. 10 full turns
+    if abs(step_count) > MAX_REASONABLE:
+        print(f"[Persist] step_count looks corrupt ({step_count}); ignoring and requiring re-home. Standby for go-home...")
+        step_count = 0
+        _run_cancellable(go_home2)
 
     logging.info("Starting stepper motor control")
 
