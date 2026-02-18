@@ -86,5 +86,3 @@ Suggested first-time flow:
 - `monochromator.py`: serial control for SD3 monochromator commands.
 - `carousel.py`, `laser_serial.py`, `serial_generic.py`: auxiliary serial tools.
 
-## License
-No license file is included yet.

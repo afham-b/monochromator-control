@@ -28,17 +28,38 @@ try:
 except Exception:
     list_ports = None  # we’ll still try known defaults if tools aren’t present
 
-# Cross-platform input flushing
-if platform.system() == "Windows":
-    # No termios on Windows; define a no-op
-    def flush_input():
-        # Windows console input isn’t line-buffered the same way; nothing to flush.
-        return
-else:
-    import termios
-    def flush_input():
-        # POSIX: flush stdin
-        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+# # Cross-platform input flushing
+# if platform.system() == "Windows":
+#     # No termios on Windows; define a no-op
+#     def flush_input():
+#         # Windows console input isn’t line-buffered the same way; nothing to flush.
+#         return
+# else:
+#     import termios
+#     def flush_input():
+#         # POSIX: flush stdin
+#         termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+def drain_stdin():
+    """remove any queued characters so next input() is clean"""
+    if platform.system() == "Windows":
+        try:
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        except Exception:
+            pass
+    else:
+        try:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+        except Exception:
+            pass
+
+def prompt_cmd(prompt):
+    drain_stdin()
+    return input(prompt).strip().upper()
+
 
 def _pick_arduino_port(preferred=None):
     """
@@ -209,7 +230,7 @@ except Exception:
 # One live calibration instance (loaded on startup)
 _cal = None
 
-# Define your step sequence (half-step example)
+# Define your step sequence
 seq = [
     [1,0,0,1],
     [1,0,0,0],
@@ -253,10 +274,10 @@ def jog_mode2(step_delay):
         elif key == pynput_keyboard.Key.down:
             reverse_pressed = False
 
-    listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.start()
-
+    listener = None
     try:
+        listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener.start()
         while running:
             #step_delay = 0.001  # responsive fixed delay
             if forward_pressed:
@@ -272,7 +293,11 @@ def jog_mode2(step_delay):
             monitor_sensors()
             time.sleep(0.01)
     finally:
-        listener.stop()
+        if listener:
+            listener.stop()
+            listener.join(timeout=0.2)
+
+
 def _start_cancel_listener(hint="Press 'q' or Esc to cancel and return to the main menu."):
     print(hint)
     _set_cancel(False)
@@ -1093,7 +1118,9 @@ def wl_cal_menu():
                 print(f"[WL Cal] Could not load backup model: {e}")
 
         elif ch == "j":
+            drain_stdin()
             jog_mode2(step_delay=0.005)
+            drain_stdin()
 
         elif ch == "x":
             confirm = input("Clear ALL wavelength refs and model? (y/q): ").strip().lower()
@@ -1586,7 +1613,9 @@ def set_home():
     global steps_till_rev, last_switch1_state, last_switch2_state , transition_sequence, steps_since_rev
     print("Please use jog mode to set worm gear to home (switch 2 open) quit jog mode.")
     time.sleep(3)
+    drain_stdin()
     jog_mode2(step_delay=0.001)
+    drain_stdin()
 
     init_steps = step_count
     init_rev_count = rev_count
@@ -1726,7 +1755,9 @@ def position_menu():
             wl_cal_menu()
 
         elif choice in ("j", "J"):
+            drain_stdin()
             jog_mode2(step_delay)   
+            drain_stdin()
             # returns here when you quit Jog mode
 
         elif choice in ("h", "H"):
@@ -1836,7 +1867,9 @@ def goto_menu():
             print("Leaving GoTo.")
             return
         if s == "j":
+            drain_stdin()
             jog_mode2(step_delay)   # returns here when you quit Jog
+            drain_stdin()
             continue
 
         try:
@@ -1992,27 +2025,26 @@ def main():
     print("Q: Quit")
 
     while True:
-        cmd = input("Enter option GoTo, Jog, Speed Settings, Home, Calibration, Position Menu, Quit (G/J/S/H/C/P/Q): ").strip().upper()
+        cmd = prompt_cmd("Enter option GoTo, Jog, Speed Settings, Home, Calibration, Position Menu, Quit (G/J/S/H/C/P/Q): ")
         if cmd in ('G','g'):
            goto_menu()
-           flush_input()
+           drain_stdin()
         elif cmd in ('J', 'j'):
-            #jog_mode(step_delay)
-            # for mac, jog2 function uses pynput instead of keyboard package
             jog_mode2(step_delay)
-            flush_input()
+            drain_stdin()
         elif cmd in ('S', 's'):
             step_delay = set_speed(step_delay)
-            flush_input()
-
+            drain_stdin()
         elif cmd in ('H','h'): 
             home_menu()
+            drain_stdin()
         elif cmd in ('C','c'):
             print("Starting Calibration")
             calibration()
+            drain_stdin()
         elif cmd in ('P','p'):  
             position_menu()
-            flush_input()
+            drain_stdin()
 
             #move_to_wavelength(532, 1, mode="from_home_ccw")   # green, 1st order, repeatable approach
             # or
@@ -2021,11 +2053,11 @@ def main():
 
         elif cmd in ('q', 'Q'):
             print("Quitting.")
-            flush_input()
+            drain_stdin()
             break
         else:
             print("Invalid option. Enter G, J, S, H, C, P, or Q.")
-            flush_input()
+            drain_stdin()
     for pin in pins:
         board.digital[pin].write(0)
     board.exit()
