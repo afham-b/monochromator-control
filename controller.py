@@ -1641,6 +1641,222 @@ def set_home():
     
     print('Total Steps, total revs, delta steps pre-rev, delta steps post-revs:', home_steps, ' ,' ,home_revs, ' ,',home_pre_rev_steps, ' ,',home_delta_steps )
 
+
+def _sleep_with_cancel(seconds: float, check_dt: float = 0.05):
+    """Sleep in small chunks so the cancel listener can interrupt."""
+    if seconds <= 0:
+        return
+    t0 = time.time()
+    while (time.time() - t0) < seconds:
+        _check_cancel()
+        time.sleep(min(check_dt, seconds))
+
+def _frange_inclusive(a: float, b: float, step: float):
+    """Inclusive float range that works for +/- direction."""
+    if step == 0:
+        raise ValueError("step must be non-zero")
+    if (b - a) == 0:
+        return [a]
+    direction = 1 if (b > a) else -1
+    step = abs(step) * direction
+
+    vals = []
+    x = a
+    # Inclusive with tolerance to avoid float drift
+    tol = abs(step) * 1e-6 + 1e-12
+    if direction > 0:
+        while x <= b + tol:
+            vals.append(x)
+            x += step
+    else:
+        while x >= b - tol:
+            vals.append(x)
+            x += step
+    return vals
+
+def scan_wavelength(
+    lam1: float,
+    lam2: float,
+    order_m: int,
+    step_nm: float,
+    *,
+    mode: str = "shortest",
+    repeats: int = 1,
+    dwell_s: float = 0.0,
+    margin_nm: float = 0.0,
+    rehome_each_repeat: bool = False,
+    pingpong: bool = False,
+):
+    """
+    Scan from wavelength lam1 to lam2 (nm) in steps of step_nm.
+    margin_nm expands the scan on both ends in the scan direction:
+      - If increasing: start=lam1-margin, end=lam2+margin
+      - If decreasing: start=lam1+margin, end=lam2-margin
+
+    repeats repeats the scan.
+    pingpong alternates direction each repeat.
+    rehome_each_repeat will go to optical home before each repeat.
+    dwell_s pauses at each point (useful for integrations).
+    """
+    if repeats < 1:
+        raise ValueError("repeats must be >= 1")
+    if step_nm <= 0:
+        raise ValueError("step_nm must be > 0")
+
+    direction = 1 if lam2 > lam1 else -1
+    start = lam1 - direction * margin_nm
+    end   = lam2 + direction * margin_nm
+
+    points_fwd = _frange_inclusive(start, end, step_nm)
+
+    for r in range(repeats):
+        _check_cancel()
+
+        if rehome_each_repeat:
+            # Use optical home to reset mechanical state in a repeatable way
+            go_optical_home()
+
+        points = points_fwd
+        if pingpong and (r % 2 == 1):
+            points = list(reversed(points_fwd))
+
+        # Move to the first point explicitly before stepping through the list
+        move_to_wavelength_nonlinear(points[0], order_m, mode=mode)
+
+        for i, lam in enumerate(points):
+            _check_cancel()
+            # Already at first point; for the rest, move to each target
+            if i != 0:
+                move_to_wavelength_nonlinear(lam, order_m, mode=mode)
+
+            # Optional dwell for acquisition
+            _sleep_with_cancel(dwell_s)
+
+def scan_angle(
+    theta1_deg: float,
+    theta2_deg: float,
+    step_deg: float,
+    *,
+    mode: str = "shortest",
+    repeats: int = 1,
+    dwell_s: float = 0.0,
+    margin_deg: float = 0.0,
+    rehome_each_repeat: bool = False,
+    pingpong: bool = False,
+):
+    """
+    Scan from angle theta1 to theta2 (deg) in steps of step_deg.
+    margin_deg expands the scan on both ends in the scan direction.
+    """
+    if repeats < 1:
+        raise ValueError("repeats must be >= 1")
+    if step_deg <= 0:
+        raise ValueError("step_deg must be > 0")
+
+    direction = 1 if theta2_deg > theta1_deg else -1
+    start = theta1_deg - direction * margin_deg
+    end   = theta2_deg + direction * margin_deg
+
+    points_fwd = _frange_inclusive(start, end, step_deg)
+
+    for r in range(repeats):
+        _check_cancel()
+
+        if rehome_each_repeat:
+            go_optical_home()
+
+        points = points_fwd
+        if pingpong and (r % 2 == 1):
+            points = list(reversed(points_fwd))
+
+        move_to_angle_deg(points[0], mode=mode)
+
+        for i, th in enumerate(points):
+            _check_cancel()
+            if i != 0:
+                move_to_angle_deg(th, mode=mode)
+            _sleep_with_cancel(dwell_s)
+
+def scan_menu():
+    """
+    Interactive scan menu: wavelength scan or angle scan, with repeats and margin options.
+    """
+    while True:
+        print("\n--- Scan Menu ---")
+        print("1) Scan wavelength λ1 → λ2 (nm)")
+        print("2) Scan angle θ1 → θ2 (deg)")
+        print("Q) Back")
+
+        ch = input("Select: ").strip().lower()
+        if ch in ("q", "quit"):
+            return
+
+        try:
+            mode = _ask_approach_mode()  # from_home_ccw or shortest (per your implementation)
+
+            repeats_s = input("Repeats (ENTER=1): ").strip()
+            repeats = int(repeats_s) if repeats_s else 1
+
+            ping_s = input("Ping-pong direction each repeat? [y/N]: ").strip().lower()
+            pingpong = (ping_s == "y")
+
+            reh_s = input("Re-home to Optical Home at start of each repeat? [y/N]: ").strip().lower()
+            rehome_each_repeat = (reh_s == "y")
+
+            dwell_s_raw = input("Dwell at each point in seconds (ENTER=0): ").strip()
+            dwell_s = float(dwell_s_raw) if dwell_s_raw else 0.0
+
+            if ch == "1":
+                lam1 = float(_prompt_or_quit("Start wavelength λ1 (nm) (q=quit): "))
+                lam2 = float(_prompt_or_quit("End wavelength   λ2 (nm) (q=quit): "))
+                m = int(_prompt_or_quit("Diffraction order m (int) (q=quit): "))
+
+                step_nm = float(_prompt_or_quit("Step size (nm) (q=quit): "))
+                margin_nm_raw = input("Endpoint margin (nm) (ENTER=0): ").strip()
+                margin_nm = float(margin_nm_raw) if margin_nm_raw else 0.0
+
+                print("Scanning... (press 'q' or Esc to cancel)")
+                _run_cancellable(
+                    scan_wavelength,
+                    lam1, lam2, m, step_nm,
+                    mode=mode,
+                    repeats=repeats,
+                    dwell_s=dwell_s,
+                    margin_nm=margin_nm,
+                    rehome_each_repeat=rehome_each_repeat,
+                    pingpong=pingpong,
+                )
+
+            elif ch == "2":
+                th1 = float(_prompt_or_quit("Start angle θ1 (deg) (q=quit): "))
+                th2 = float(_prompt_or_quit("End angle   θ2 (deg) (q=quit): "))
+                step_deg = float(_prompt_or_quit("Step size (deg) (q=quit): "))
+                margin_deg_raw = input("Endpoint margin (deg) (ENTER=0): ").strip()
+                margin_deg = float(margin_deg_raw) if margin_deg_raw else 0.0
+
+                print("Scanning... (press 'q' or Esc to cancel)")
+                _run_cancellable(
+                    scan_angle,
+                    th1, th2, step_deg,
+                    mode=mode,
+                    repeats=repeats,
+                    dwell_s=dwell_s,
+                    margin_deg=margin_deg,
+                    rehome_each_repeat=rehome_each_repeat,
+                    pingpong=pingpong,
+                )
+            else:
+                print("Invalid option.")
+                continue
+
+        except _QuitToMain:
+            print("Leaving Scan menu.")
+            return
+        except ValueError as e:
+            print(f"Input error: {e}")
+            continue
+
+
 def home_menu():
     while True:
         print("\n--- Home Menu ---")
@@ -2018,21 +2234,22 @@ def main():
     print("Stepper Motor Control")
     print("G: GoTo Step. +N Forward CW, -N Reverse CCW")
     print("J: Jog Mode (UP/DOWN arrows)")
-    print("S: Speed Settings")
+    print("V: Speed Settings")
     print("H: Home Menu")
     print("C: Calibration")
     print("P: Position Menu (Angle/Wavelength)")
+    print("S: Scan Menu (wavelength/angle sequences)")
     print("Q: Quit")
 
     while True:
-        cmd = prompt_cmd("Enter option GoTo, Jog, Speed Settings, Home, Calibration, Position Menu, Quit (G/J/S/H/C/P/Q): ")
+        cmd = prompt_cmd("Enter option GoTo, Jog, Speed Settings, Home, Calibration, Position Menu, Scan, Quit (G/J/V/H/C/P/S/Q): ")
         if cmd in ('G','g'):
            goto_menu()
            drain_stdin()
         elif cmd in ('J', 'j'):
             jog_mode2(step_delay)
             drain_stdin()
-        elif cmd in ('S', 's'):
+        elif cmd in ('V', 'v'):
             step_delay = set_speed(step_delay)
             drain_stdin()
         elif cmd in ('H','h'): 
@@ -2050,13 +2267,18 @@ def main():
             # or
             #move_to_wavelength(650, 1, mode="shortest")        # quicker, chooses direction automatically
             #move_to_angle_deg(12.5, mode="from_home_ccw").     #going to 12.5 degrees, counterclockwise from home
+        elif cmd in ('S','s'):
+            scan_menu()
+                # example: scan_wavelength(500, 700, m=1, step_nm   = 5, mode="shortest", repeats=2, dwell_s=0.5, margin_nm=10, rehome_each_repeat=True, pingpong=True)
+                # example: scan_angle(0, 90, step_deg=5, mode="from_home_ccw", repeats=1, dwell_s=0.5, margin_deg=5, rehome_each_repeat=False, pingpong=False)  
+            drain_stdin()
 
         elif cmd in ('q', 'Q'):
             print("Quitting.")
             drain_stdin()
             break
         else:
-            print("Invalid option. Enter G, J, S, H, C, P, or Q.")
+            print("Invalid option. Enter G, J, V, H, C, P, S, or Q.")
             drain_stdin()
     for pin in pins:
         board.digital[pin].write(0)
