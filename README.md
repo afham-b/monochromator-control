@@ -8,6 +8,7 @@ Python-based control and calibration tooling for a stepper-driven monochromator 
 - Homing and optical-home offset.
 - Calibration for steps/rev, steps/deg, backlash, and directional bias.
 - Wavelength calibration with stored references and linear fit.
+- Scanning function between wavelengths or grating angles. 
 - Persistent state in `state/` and logs in `logs/`.
 
 ## Hardware
@@ -55,10 +56,11 @@ python controller.py
 Main menu options:
 - `G` GoTo relative steps (+CW / -CCW)
 - `J` Jog mode (UP/DOWN arrows)
-- `S` Speed settings
+- `V` Speed settings
 - `H` Home menu
 - `C` Calibration
 - `P` Position menu (angle/wavelength)
+- `S` Scan menu
 - `Q` Quit
 
 Suggested first-time flow:
