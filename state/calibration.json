@@ -9,12 +9,12 @@
   },
   "s1": {
     "edge_holdoff_steps": null,
-    "steps_per_rev": 100
+    "steps_per_rev": 800
   },
   "s2": {
-    "steps_per_deg": 50.044444444444444,
-    "steps_per_rev": 18016
+    "steps_per_deg": 400.0027777777778,
+    "steps_per_rev": 144001
   },
-  "saved_at": 1761259553.8969631,
+  "saved_at": 1774561239.07971,
   "version": 1
 }
