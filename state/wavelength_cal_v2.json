@@ -1,0 +1,48 @@
+{
+  "model": {
+    "amplitude_nm": 1632.2130505944713,
+    "cos_coeff_nm": -0.04251973452062688,
+    "kind": "sin_cos",
+    "phase_deg": -0.001492575576109309,
+    "sin_coeff_nm": 1632.213050040644
+  },
+  "refs": [
+    {
+      "lambda_nm": 447.1,
+      "order_m": 1,
+      "theta_deg": 15.902389566739119
+    },
+    {
+      "lambda_nm": 471.3,
+      "order_m": 1,
+      "theta_deg": 16.782383455670445
+    },
+    {
+      "lambda_nm": 492.1,
+      "order_m": 1,
+      "theta_deg": 17.554878091124365
+    },
+    {
+      "lambda_nm": 501.8,
+      "order_m": 1,
+      "theta_deg": 17.897375712668662
+    },
+    {
+      "lambda_nm": 587.5,
+      "order_m": 1,
+      "theta_deg": 21.09985347323977
+    },
+    {
+      "lambda_nm": 667.8,
+      "order_m": 1,
+      "theta_deg": 24.152332275470307
+    },
+    {
+      "lambda_nm": 706.5,
+      "order_m": 1,
+      "theta_deg": 25.64982187623697
+    }
+  ],
+  "saved_at": 1775256972.272148,
+  "version": 1
+}
