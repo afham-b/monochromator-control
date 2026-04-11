@@ -244,12 +244,16 @@ JOG_TERMINAL_REFRESH_S = 0.05
 OFFSET_ADJUST_REFRESH_S = 0.05
 OFFSET_ADJUST_MAX_PENDING = 8
 LOG_TO_CONSOLE = False
+MIN_STEP_DELAY_MS = 1
+MAX_STEP_DELAY_MS = 1000
+JOG_SPEED_STEP_MS = 1
 
 # --- Logging & persistence paths ---
 LOG_DIR   = "logs"
 LOG_FILE  = os.path.join(LOG_DIR, "stepper.log")  # single, ever-growing log
 STATE_DIR = "state"
 STEP_FILE = os.path.join(STATE_DIR, "step_count.txt")  # holds only the step_count number
+JOG_SPEED_FILE = os.path.join(STATE_DIR, "jog_speed_ms.txt")
 
 #optical-home offset persistence
 OPTICAL_OFFSET_FILE = os.path.join(STATE_DIR, "optical_home_offset.txt")
@@ -302,10 +306,43 @@ _cal = None
 step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
 
-def jog_mode2(step_delay):
-    global JOG_STREAM_SENSORS, JOG_DISPLAY_DIR
+def _delay_to_ms(delay_s):
+    return int(round(float(delay_s) * 1000.0))
+
+def _clamp_step_delay_ms(ms):
+    return max(MIN_STEP_DELAY_MS, min(MAX_STEP_DELAY_MS, int(round(float(ms)))))
+
+def _persist_jog_speed():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = JOG_SPEED_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(_delay_to_ms(step_delay)))
+    os.replace(tmp, JOG_SPEED_FILE)
+
+def _set_step_delay_ms(ms, *, persist=True):
+    global step_delay
+    step_delay = _clamp_step_delay_ms(ms) / 1000.0
+    if persist:
+        _persist_jog_speed()
+    return step_delay
+
+def _load_persisted_jog_speed():
+    global step_delay
+    try:
+        with open(JOG_SPEED_FILE, "r") as f:
+            ms = _clamp_step_delay_ms(int(f.read().strip()))
+            step_delay = ms / 1000.0
+            print(f"[Persist] Jog speed = {ms} ms/step (from {JOG_SPEED_FILE})")
+    except FileNotFoundError:
+        print(f"[Persist] No jog-speed file; defaulting to {_delay_to_ms(step_delay)} ms/step")
+    except Exception as e:
+        print(f"[Persist] Could not read {JOG_SPEED_FILE} ({e}); using {_delay_to_ms(step_delay)} ms/step")
+
+def jog_mode2():
+    global JOG_STREAM_SENSORS, JOG_DISPLAY_DIR, step_delay
     print("\n--- Jog Mode ---")
     print("Hold UP for forward, DOWN for reverse. Press Q to quit jog mode.")
+    print("RIGHT arrow speeds up by 1 ms/step. LEFT arrow slows down by 1 ms/step.")
     print("[Jog] Manual jog uses exact steps only; backlash compensation is disabled here.")
     JOG_STREAM_SENSORS = True
     JOG_DISPLAY_DIR = 0
@@ -313,6 +350,16 @@ def jog_mode2(step_delay):
     running = True
     forward_pressed = False
     reverse_pressed = False
+    speed_adjust_queue = deque()
+    speed_keys_held = set()
+
+    def _apply_speed_delta(delta_ms):
+        old_ms = _delay_to_ms(step_delay)
+        _set_step_delay_ms(old_ms + delta_ms, persist=True)
+        new_ms = _delay_to_ms(step_delay)
+        if new_ms != old_ms:
+            _clear_sensor_terminal_line()
+            print(f"[Jog] Speed set to {new_ms} ms/step.")
 
     def on_press(key):
         nonlocal running, forward_pressed, reverse_pressed
@@ -320,6 +367,14 @@ def jog_mode2(step_delay):
             forward_pressed = True
         elif key == pynput_keyboard.Key.down:
             reverse_pressed = True
+        elif key == pynput_keyboard.Key.right:
+            if key not in speed_keys_held:
+                speed_keys_held.add(key)
+                speed_adjust_queue.append(-JOG_SPEED_STEP_MS)
+        elif key == pynput_keyboard.Key.left:
+            if key not in speed_keys_held:
+                speed_keys_held.add(key)
+                speed_adjust_queue.append(+JOG_SPEED_STEP_MS)
         elif hasattr(key, 'char') and key.char and key.char.lower() == 'q':
             running = False
             _clear_sensor_terminal_line()
@@ -334,6 +389,8 @@ def jog_mode2(step_delay):
             forward_pressed = False
         elif key == pynput_keyboard.Key.down:
             reverse_pressed = False
+        elif key in (pynput_keyboard.Key.left, pynput_keyboard.Key.right):
+            speed_keys_held.discard(key)
 
     listener = None
     try:
@@ -341,12 +398,15 @@ def jog_mode2(step_delay):
         listener.start()
         while running:
             JOG_DISPLAY_DIR = 0
-            #step_delay = 0.001  # responsive fixed delay
+            while speed_adjust_queue:
+                _apply_speed_delta(speed_adjust_queue.popleft())
             if forward_pressed:
                 JOG_DISPLAY_DIR = +1
                 move_exact(steps=1, step_delay=step_delay, direction=1)
                 while forward_pressed and running:
                     JOG_DISPLAY_DIR = +1
+                    while speed_adjust_queue:
+                        _apply_speed_delta(speed_adjust_queue.popleft())
                     move_exact(steps=1, step_delay=step_delay, direction=1)
 
             if reverse_pressed:
@@ -354,6 +414,8 @@ def jog_mode2(step_delay):
                 move_exact(steps=1, step_delay=step_delay, direction=-1)
                 while reverse_pressed and running:
                     JOG_DISPLAY_DIR = -1
+                    while speed_adjust_queue:
+                        _apply_speed_delta(speed_adjust_queue.popleft())
                     move_exact(steps=1, step_delay=step_delay, direction=-1)
 
             monitor_sensors(reason="jog")
@@ -876,21 +938,22 @@ def move_biased(steps, step_delay, direction):
     if _last_move_dir is not None and direction != _last_move_dir:
         _persist_step_count()
         if BACKLASH_STEPS > 0:
-            # Take up slack. These are "compensation" steps; you can treat them
-            # as physical-only, but since your counters track actual motion,
-            # letting them count is fine.
-            move_stepper(seq, BACKLASH_STEPS, step_delay, direction)
+            # Take up slack physically, but do not advance the logical stage coordinate.
+            move_stepper(seq, BACKLASH_STEPS, step_delay, direction, count_logical_steps=False)
 
-    adj_steps = steps
+    extra_reverse_steps = 0
     if direction == -1 and DIR_REVERSE_SCALE != 1.0:
-        # accumulate only the *extra* steps from scaling
+        # Accumulate only the *extra* physical steps needed for reverse compensation.
+        # These should not advance the logical stage coordinate.
         _rev_scale_err_accum += steps * (DIR_REVERSE_SCALE - 1.0)
         extra = int(round(_rev_scale_err_accum))
         _rev_scale_err_accum -= extra
-        adj_steps = steps + max(0, extra)
+        extra_reverse_steps = max(0, extra)
 
-    if adj_steps > 0:
-        move_stepper(seq, adj_steps, step_delay, direction)
+    if steps > 0:
+        move_stepper(seq, steps, step_delay, direction, count_logical_steps=True)
+    if extra_reverse_steps > 0:
+        move_stepper(seq, extra_reverse_steps, step_delay, direction, count_logical_steps=False)
         
     _last_move_dir = direction
     _check_cancel() 
@@ -903,7 +966,7 @@ def move_exact(steps, step_delay, direction):
     move_stepper(seq, int(steps), step_delay, direction)
     _last_move_dir = direction
 
-def move_stepper(seq, steps,step_delay, direction):
+def move_stepper(seq, steps,step_delay, direction, count_logical_steps=True):
     global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, _steps_since_any_edge
     global home, switch1, switch2, steps_per_rev, steps_till_rev, steps_since_rev, is_1rev_completed
     global _seq_index
@@ -917,10 +980,11 @@ def move_stepper(seq, steps,step_delay, direction):
         for pin, val in zip(pins, seq[_seq_index]):
             board.digital[pin].write(val)
 
-        # One commanded stage step has now physically happened.
-        step_count += 1 * direction
-        steps_since_rev += 1 * direction
-        _steps_since_any_edge += 1 if direction > 0 else -1
+        # One commanded step has physically happened.
+        if count_logical_steps:
+            step_count += 1 * direction
+            steps_since_rev += 1 * direction
+            _steps_since_any_edge += 1 if direction > 0 else -1
 
         monitor_sensors()
 
@@ -934,11 +998,11 @@ def move_stepper(seq, steps,step_delay, direction):
         else:
             state1 = "OPEN"
 
-        if state1 == "OPEN":
+        if count_logical_steps and state1 == "OPEN":
             is_1rev_completed = True
 
         # Track transition sequence for open->blocked->open
-        if last_switch1_state is not None:
+        if count_logical_steps and last_switch1_state is not None:
             # Only add when state changes
             if state1 != last_switch1_state:
                 transition_sequence.append(state1)
@@ -957,9 +1021,10 @@ def move_stepper(seq, steps,step_delay, direction):
         last_switch1_state = state1
         time.sleep(step_delay)
 
-        _maybe_persist_step_count()
+        if count_logical_steps:
+            _maybe_persist_step_count()
 
-        if is_1rev_completed == False and state1 == "BLOCKED":
+        if count_logical_steps and is_1rev_completed == False and state1 == "BLOCKED":
             steps_till_rev += 1 *direction
 
     # Turn all pins off when done
@@ -967,9 +1032,12 @@ def move_stepper(seq, steps,step_delay, direction):
         board.digital[pin].write(0)
 
     # persist current position to disk
-    _persist_step_count()
+    if count_logical_steps:
+        _persist_step_count()
 
-def set_speed(current_delay):
+def set_speed(current_delay=None):
+    global step_delay
+    current_delay = step_delay if current_delay is None else current_delay
     print(f"Current speed: {int(current_delay*1000)} ms per step")
     print("Increasing ms/step results in slower rotation, with 1ms being fastest")
     while True:
@@ -977,14 +1045,13 @@ def set_speed(current_delay):
             val = input("Enter new speed in ms per step (e.g., 15), or ENTER to keep: ").strip()
             if val == '':
                 print("Keeping current speed.")
-                return current_delay
+                return step_delay
             ms = int(val)
-            if ms < 1 or ms > 1000:
-                print("Enter a value between 1 and 1000 ms.")
+            if ms < MIN_STEP_DELAY_MS or ms > MAX_STEP_DELAY_MS:
+                print(f"Enter a value between {MIN_STEP_DELAY_MS} and {MAX_STEP_DELAY_MS} ms.")
                 continue
-            new_delay = ms / 1000.0
             print(f"Speed set to {ms} ms per step.")
-            return new_delay
+            return _set_step_delay_ms(ms, persist=True)
         except ValueError:
             print("Invalid input. Enter a number.")
 
@@ -1224,7 +1291,7 @@ def _ensure_cal_ready():
     return _cal
 
 def _wl_path(state_dir):
-    return os.path.join(state_dir, "wavelength_cal_v2.json")
+    return os.path.join(state_dir, "wavelength_cal.json")
 
 def _wl_load(state_dir):
     # prefer your provided cal_store API if available
@@ -1261,8 +1328,8 @@ def restore_wl_from_backup():
     global _cal, WL
     _ensure_cal_ready()
 
-    backup_path = os.path.join(STATE_DIR, "wavelength_cal_v2_backup.json")
-    target_path = os.path.join(STATE_DIR, "wavelength_cal_v2.json")
+    backup_path = os.path.join(STATE_DIR, "wavelength_cal_backup.json")
+    target_path = os.path.join(STATE_DIR, "wavelength_cal.json")
 
     try:
         with open(backup_path, "r") as f:
@@ -1448,7 +1515,7 @@ def wl_cal_menu():
 
         elif ch == "j":
             drain_stdin()
-            jog_mode2(step_delay=0.005)
+            jog_mode2()
             drain_stdin()
 
         elif ch == "x":
@@ -1857,7 +1924,7 @@ def _format_sensor_snapshot(state1, state2, *, reason=None, debug=False):
             pass
         ref = "BOTH-OPEN" if (state1 == "OPEN" and state2 == "OPEN") else ("S2-OPEN" if state2 == "OPEN" else "--")
         return (
-            f"JOG | dir={_direction_label(JOG_DISPLAY_DIR):<4} | step={step_count:+8d} | "
+            f"JOG | dir={_direction_label(JOG_DISPLAY_DIR):<4} | spd={_delay_to_ms(step_delay):4d}ms | step={step_count:+8d} | "
             f"theta={theta_text} | S1={state1:<7} | S2={state2:<7} | ref={ref}"
         )
     tag = "[Sensors:debug]" if debug else "[Sensors]"
@@ -2435,7 +2502,7 @@ def set_home():
     print("Please use jog mode to set worm gear to home (switch 2 open) quit jog mode.")
     time.sleep(3)
     drain_stdin()
-    jog_mode2(step_delay=0.001)
+    jog_mode2()
     drain_stdin()
 
     init_steps = step_count
@@ -2496,6 +2563,35 @@ def _frange_inclusive(a: float, b: float, step: float):
             x += step
     return vals
 
+def _move_scan_to_first_target(target_steps: int, *, mode: str, force_home: bool = False):
+    """
+    Position to the first point of a scan.
+    - `mode` only controls the very first acquisition of the scan start.
+    - `force_home` is used by rehome-per-repeat.
+    """
+    target_steps = int(round(target_steps))
+
+    if force_home or mode == "from_home_ccw":
+        if not go_home2():
+            raise RuntimeError("Could not establish Disk Home before scan start.")
+        _stage_move_signed(target_steps)
+        return
+
+    if mode == "shortest":
+        _move_to_target_steps_fixed_approach(target_steps)
+        return
+
+    raise ValueError("mode must be 'from_home_ccw' or 'shortest'")
+
+def _scan_step_to_target(target_steps: int):
+    """
+    Move directly from the current point to the next scan point without re-homing.
+    This preserves a true stepped scan between endpoints.
+    """
+    delta_steps = int(round(target_steps)) - int(round(step_count))
+    if delta_steps != 0:
+        _stage_move_signed(delta_steps)
+
 def scan_wavelength(
     lam1: float,
     lam2: float,
@@ -2517,39 +2613,46 @@ def scan_wavelength(
 
     repeats repeats the scan.
     pingpong alternates direction each repeat.
-    rehome_each_repeat will go to optical home before each repeat.
+    rehome_each_repeat will re-index at Disk Home before each repeat.
     dwell_s pauses at each point (useful for integrations).
     """
     if repeats < 1:
         raise ValueError("repeats must be >= 1")
+    if order_m == 0:
+        raise ValueError("order_m must be non-zero")
     if step_nm <= 0:
         raise ValueError("step_nm must be > 0")
+    if dwell_s < 0:
+        raise ValueError("dwell_s must be >= 0")
+    if margin_nm < 0:
+        raise ValueError("margin_nm must be >= 0")
 
     direction = 1 if lam2 > lam1 else -1
     start = lam1 - direction * margin_nm
     end   = lam2 + direction * margin_nm
 
     points_fwd = _frange_inclusive(start, end, step_nm)
+    target_steps_fwd = []
+    for lam in points_fwd:
+        theta = _theta_deg_from_lambda(lam, order_m)
+        target_steps_fwd.append(_target_steps_from_disk_home(theta))
 
     for r in range(repeats):
         _check_cancel()
+        reverse_repeat = pingpong and (r % 2 == 1)
+        points = list(reversed(points_fwd)) if reverse_repeat else points_fwd
+        target_steps = list(reversed(target_steps_fwd)) if reverse_repeat else target_steps_fwd
 
-        if rehome_each_repeat:
-            # Use optical home to reset mechanical state in a repeatable way
-            go_optical_home()
-
-        points = points_fwd
-        if pingpong and (r % 2 == 1):
-            points = list(reversed(points_fwd))
-
-        # Move to the first point explicitly before stepping through the list
-        move_to_wavelength_nonlinear(points[0], order_m, mode=mode)
+        force_home = rehome_each_repeat
+        if r == 0 or force_home:
+            _move_scan_to_first_target(target_steps[0], mode=mode, force_home=force_home)
+        else:
+            _scan_step_to_target(target_steps[0])
 
         for i, lam in enumerate(points):
             _check_cancel()
-            # Already at first point; for the rest, move to each target
             if i != 0:
-                move_to_wavelength_nonlinear(lam, order_m, mode=mode)
+                _scan_step_to_target(target_steps[i])
 
             # Optional dwell for acquisition
             _sleep_with_cancel(dwell_s)
@@ -2574,29 +2677,34 @@ def scan_angle(
         raise ValueError("repeats must be >= 1")
     if step_deg <= 0:
         raise ValueError("step_deg must be > 0")
+    if dwell_s < 0:
+        raise ValueError("dwell_s must be >= 0")
+    if margin_deg < 0:
+        raise ValueError("margin_deg must be >= 0")
 
     direction = 1 if theta2_deg > theta1_deg else -1
     start = theta1_deg - direction * margin_deg
     end   = theta2_deg + direction * margin_deg
 
     points_fwd = _frange_inclusive(start, end, step_deg)
+    target_steps_fwd = [_target_steps_from_disk_home(theta) for theta in points_fwd]
 
     for r in range(repeats):
         _check_cancel()
+        reverse_repeat = pingpong and (r % 2 == 1)
+        points = list(reversed(points_fwd)) if reverse_repeat else points_fwd
+        target_steps = list(reversed(target_steps_fwd)) if reverse_repeat else target_steps_fwd
 
-        if rehome_each_repeat:
-            go_optical_home()
-
-        points = points_fwd
-        if pingpong and (r % 2 == 1):
-            points = list(reversed(points_fwd))
-
-        move_to_angle_deg(points[0], mode=mode)
+        force_home = rehome_each_repeat
+        if r == 0 or force_home:
+            _move_scan_to_first_target(target_steps[0], mode=mode, force_home=force_home)
+        else:
+            _scan_step_to_target(target_steps[0])
 
         for i, th in enumerate(points):
             _check_cancel()
             if i != 0:
-                move_to_angle_deg(th, mode=mode)
+                _scan_step_to_target(target_steps[i])
             _sleep_with_cancel(dwell_s)
 
 def scan_menu():
@@ -2622,7 +2730,7 @@ def scan_menu():
             ping_s = input("Ping-pong direction each repeat? [y/N]: ").strip().lower()
             pingpong = (ping_s == "y")
 
-            reh_s = input("Re-home to Optical Home at start of each repeat? [y/N]: ").strip().lower()
+            reh_s = input("Re-home at Disk Home at start of each repeat? [y/N]: ").strip().lower()
             rehome_each_repeat = (reh_s == "y")
 
             dwell_s_raw = input("Dwell at each point in seconds (ENTER=0): ").strip()
@@ -2633,7 +2741,8 @@ def scan_menu():
                 lam2 = float(_prompt_or_quit("End wavelength   λ2 (nm) (q=quit): "))
                 m = int(_prompt_or_quit("Diffraction order m (int) (q=quit): "))
 
-                step_nm = float(_prompt_or_quit("Step size (nm) (q=quit): "))
+                step_nm_raw = _prompt_or_quit("Step size (nm) (ENTER=1.0, q=quit): ")
+                step_nm = float(step_nm_raw) if step_nm_raw else 1.0
                 margin_nm_raw = input("Endpoint margin (nm) (ENTER=0): ").strip()
                 margin_nm = float(margin_nm_raw) if margin_nm_raw else 0.0
 
@@ -2652,7 +2761,8 @@ def scan_menu():
             elif ch == "2":
                 th1 = float(_prompt_or_quit("Start angle θ1 (deg) (q=quit): "))
                 th2 = float(_prompt_or_quit("End angle   θ2 (deg) (q=quit): "))
-                step_deg = float(_prompt_or_quit("Step size (deg) (q=quit): "))
+                step_deg_raw = _prompt_or_quit("Step size (deg) (ENTER=0.05, q=quit): ")
+                step_deg = float(step_deg_raw) if step_deg_raw else 0.05
                 margin_deg_raw = input("Endpoint margin (deg) (ENTER=0): ").strip()
                 margin_deg = float(margin_deg_raw) if margin_deg_raw else 0.0
 
@@ -2729,7 +2839,7 @@ def position_menu():
         print("3) Move to wavelength λ (nm) & order m")
         print("4) Show current S2 steps/deg and integrity check")
         print("5) Wavelength calibration (refs & fit)") 
-        print("J) Jog mode (hold UP/DOWN to move)")
+        print("J) Jog mode (UP/DOWN move, LEFT/RIGHT adjust speed)")
         print("H) Go Home")
         print("Q) Back to main menu")
 
@@ -2795,7 +2905,7 @@ def position_menu():
 
         elif choice in ("j", "J"):
             drain_stdin()
-            jog_mode2(step_delay)   
+            jog_mode2()
             drain_stdin()
             # returns here when you quit Jog mode
 
@@ -2887,34 +2997,54 @@ def _ask_approach_mode():
 
 def goto_menu():
     """
-    Repeatedly prompt for a signed step move.
-    +N => CW, -N => CCW (matches internal convention: direction=+1 is CW).
+    Repeatedly prompt for either a relative or absolute step move.
+    +N/-N => relative CW/CCW move.
+    =N    => absolute step target from Disk Home.
     Type 'j' to jump to Jog, 'q' to quit back to main.
     """
     global step_delay  # for jog_mode2
 
-    print("\n--- GoTo (relative steps) ---")
-    print("Enter an integer step count:")
-    print("  +N = CW (forward)")
-    print("  -N = CCW (reverse)")
+    print("\n--- GoTo (steps) ---")
+    print(f"Current step_count = {step_count}")
+    print("Enter either:")
+    print("  +N = relative CW move")
+    print("  -N = relative CCW move")
+    print("  =N = absolute target step position")
     print("  j  = jump to Jog")
     print("  q  = quit to main menu")
 
     while True:
-        s = input("GoTo steps (+CW / -CCW, j, q): ").strip().lower()
+        s = input("GoTo command (+/-N relative, =N absolute, j, q): ").strip().lower()
         if s == "q":
             print("Leaving GoTo.")
             return
         if s == "j":
             drain_stdin()
-            jog_mode2(step_delay)   # returns here when you quit Jog
+            jog_mode2()   # returns here when you quit Jog
             drain_stdin()
+            continue
+        if s.startswith("="):
+            try:
+                target_steps = int(s[1:].strip())
+            except ValueError:
+                print("Absolute targets must look like =500 or =-1200.")
+                continue
+            delta_steps = target_steps - step_count
+            if delta_steps == 0:
+                print(f"Already at absolute step {target_steps}.")
+                continue
+            print(
+                f"[GoTo] Absolute target: {target_steps} steps "
+                f"(delta {delta_steps:+d}, {'CW' if delta_steps > 0 else 'CCW'})"
+            )
+            _stage_move_signed(delta_steps)
+            print(f"Done. Current step_count = {step_count}")
             continue
 
         try:
             user_steps = int(s)
         except ValueError:
-            print("Please enter an integer (e.g., 120 or -350), or j, or q.")
+            print("Please enter +N/-N, =N, j, or q.")
             continue
 
         if user_steps == 0:
@@ -3044,6 +3174,9 @@ def main():
     # Restore last position (if any)
     _load_persisted_step_count()
 
+    # Restore jog speed used by all jog entry points
+    _load_persisted_jog_speed()
+
     # NEW: restore optical-home offset
     _load_optical_offset()
 
@@ -3079,7 +3212,7 @@ def main():
 
     print("Stepper Motor Control")
     print("G: GoTo Step. +N Forward CW, -N Reverse CCW")
-    print("J: Jog Mode (UP/DOWN arrows)")
+    print("J: Jog Mode (UP/DOWN move, LEFT/RIGHT adjust speed)")
     print("D: Toggle Debug Mode")
     print("V: Speed Settings")
     print("H: Home Menu")
@@ -3094,7 +3227,7 @@ def main():
            goto_menu()
            drain_stdin()
         elif cmd in ('J', 'j'):
-            jog_mode2(step_delay)
+            jog_mode2()
             drain_stdin()
         elif cmd in ('D', 'd'):
             toggle_debug_mode()
