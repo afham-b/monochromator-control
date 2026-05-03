@@ -6,9 +6,11 @@
 
 import builtins
 import os, sys, time, math, logging, platform, json
+import subprocess
 import threading
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from pyfirmata import Arduino, util
 
 try:
@@ -85,6 +87,43 @@ def _make_keyboard_listener(*, on_press=None, on_release=None):
         return pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
 
 
+def _serial_port_score(port_info):
+    desc = f"{port_info.description or ''} {port_info.manufacturer or ''}".lower()
+    score = 0
+    if "arduino" in desc:
+        score += 10
+    if "usb" in desc:
+        score += 3
+    if "modem" in desc:
+        score += 2
+    if platform.system() == "Windows" and port_info.device.upper().startswith("COM"):
+        score += 1
+    if platform.system() != "Windows" and "/dev/cu." in port_info.device:
+        score += 1
+    return score
+
+def list_available_serial_ports():
+    ports = []
+    if list_ports is None:
+        return ports
+
+    for port_info in list(list_ports.comports()):
+        detail_parts = [x for x in (port_info.description, port_info.manufacturer) if x]
+        detail = " | ".join(detail_parts)
+        label = port_info.device if not detail else f"{port_info.device} - {detail}"
+        ports.append(
+            {
+                "device": port_info.device,
+                "description": port_info.description or "",
+                "manufacturer": port_info.manufacturer or "",
+                "label": label,
+                "score": _serial_port_score(port_info),
+            }
+        )
+
+    ports.sort(key=lambda item: (-item["score"], item["device"]))
+    return ports
+
 def _pick_arduino_port(preferred=None):
     """
     Return a serial port string for the Arduino on macOS or Windows.
@@ -99,26 +138,11 @@ def _pick_arduino_port(preferred=None):
     if list_ports is None:
         return "COM10" if platform.system() == "Windows" else "/dev/cu.usbmodem1101"
 
-    candidates = list(list_ports.comports())
+    candidates = list_available_serial_ports()
     if not candidates:
         # No ports found; fall back
         return "COM10" if platform.system() == "Windows" else "/dev/cu.usbmodem101"
-
-    # Heuristics: prefer ports whose descriptions mention Arduino/USB/Modem
-    def score(p):
-        desc = f"{p.description or ''} {p.manufacturer or ''}".lower()
-        s = 0
-        if "arduino" in desc: s += 10
-        if "usb" in desc:     s += 3
-        if "modem" in desc:   s += 2
-        if platform.system() == "Windows" and p.device.upper().startswith("COM"):
-            s += 1
-        if platform.system() != "Windows" and "/dev/cu." in p.device:
-            s += 1
-        return s
-
-    best = max(candidates, key=score)
-    return best.device
+    return candidates[0]["device"]
 
 # --- Board init (cross-platform, lazy for GUI safety) ---
 PORT_OVERRIDE = os.getenv("ARDUINO_PORT")  # allow manual override via env var
@@ -138,12 +162,12 @@ switch2 = None
 # use to initialize an array to track the switch states
 last_states = [None, None]
 
-def _init_board():
+def _init_board(preferred_port=None):
     global port, board, it, switch1, switch2, last_states
     if board is not None:
         return board
 
-    port = _pick_arduino_port(PORT_OVERRIDE)
+    port = _pick_arduino_port(preferred_port or PORT_OVERRIDE)
     try:
         board = Arduino(port)
     except Exception as e:
@@ -441,6 +465,111 @@ def jog_mode2():
         settle_terminal_input()
 
 
+def gui_cli_jog_mode(stop_event=None):
+    global JOG_STREAM_SENSORS, JOG_DISPLAY_DIR, step_delay
+    print("\n--- GUI CLI Jog Mode ---")
+    print("Hold UP for forward, DOWN for reverse. Press Q to quit jog mode.")
+    print("RIGHT arrow speeds up by 1 ms/step. LEFT arrow slows down by 1 ms/step.")
+    print("[Jog] Manual jog uses exact steps only; backlash compensation is disabled here.")
+    JOG_STREAM_SENSORS = True
+    JOG_DISPLAY_DIR = 0
+
+    running = True
+    forward_pressed = False
+    reverse_pressed = False
+    speed_adjust_queue = deque()
+    speed_keys_held = set()
+    exit_reported = False
+
+    def _report_exit():
+        nonlocal exit_reported
+        if exit_reported:
+            return
+        exit_reported = True
+        _clear_sensor_terminal_line()
+        print("Exiting jog mode.")
+        print("step count", step_count)
+        print("rev count", rev_count)
+
+    def _apply_speed_delta(delta_ms):
+        old_ms = _delay_to_ms(step_delay)
+        _set_step_delay_ms(old_ms + delta_ms, persist=True)
+        new_ms = _delay_to_ms(step_delay)
+        if new_ms != old_ms:
+            _clear_sensor_terminal_line()
+            print(f"[Jog] Speed set to {new_ms} ms/step.")
+
+    def on_press(key):
+        nonlocal running, forward_pressed, reverse_pressed
+        if stop_event is not None and stop_event.is_set():
+            running = False
+            return False
+        if key == pynput_keyboard.Key.up:
+            forward_pressed = True
+        elif key == pynput_keyboard.Key.down:
+            reverse_pressed = True
+        elif key == pynput_keyboard.Key.right:
+            if key not in speed_keys_held:
+                speed_keys_held.add(key)
+                speed_adjust_queue.append(-JOG_SPEED_STEP_MS)
+        elif key == pynput_keyboard.Key.left:
+            if key not in speed_keys_held:
+                speed_keys_held.add(key)
+                speed_adjust_queue.append(+JOG_SPEED_STEP_MS)
+        elif hasattr(key, 'char') and key.char and key.char.lower() == 'q':
+            running = False
+            _report_exit()
+            return False
+
+    def on_release(key):
+        nonlocal forward_pressed, reverse_pressed
+        if key == pynput_keyboard.Key.up:
+            forward_pressed = False
+        elif key == pynput_keyboard.Key.down:
+            reverse_pressed = False
+        elif key in (pynput_keyboard.Key.left, pynput_keyboard.Key.right):
+            speed_keys_held.discard(key)
+
+    listener = None
+    try:
+        listener = _make_keyboard_listener(on_press=on_press, on_release=on_release)
+        listener.start()
+        while running and not (stop_event is not None and stop_event.is_set()):
+            JOG_DISPLAY_DIR = 0
+            while speed_adjust_queue:
+                _apply_speed_delta(speed_adjust_queue.popleft())
+            if forward_pressed:
+                JOG_DISPLAY_DIR = +1
+                move_exact(steps=1, step_delay=step_delay, direction=1)
+                while forward_pressed and running and not (stop_event is not None and stop_event.is_set()):
+                    JOG_DISPLAY_DIR = +1
+                    while speed_adjust_queue:
+                        _apply_speed_delta(speed_adjust_queue.popleft())
+                    move_exact(steps=1, step_delay=step_delay, direction=1)
+
+            if reverse_pressed:
+                JOG_DISPLAY_DIR = -1
+                move_exact(steps=1, step_delay=step_delay, direction=-1)
+                while reverse_pressed and running and not (stop_event is not None and stop_event.is_set()):
+                    JOG_DISPLAY_DIR = -1
+                    while speed_adjust_queue:
+                        _apply_speed_delta(speed_adjust_queue.popleft())
+                    move_exact(steps=1, step_delay=step_delay, direction=-1)
+
+            monitor_sensors(reason="jog")
+            time.sleep(0.01)
+
+        _report_exit()
+    finally:
+        JOG_STREAM_SENSORS = False
+        JOG_DISPLAY_DIR = 0
+        _clear_sensor_terminal_line()
+        if listener:
+            listener.stop()
+            listener.join(timeout=0.2)
+        settle_terminal_input()
+
+
 def _start_cancel_listener(hint="Press 'q' or Esc to cancel and return to the main menu."):
     print(hint)
     _set_cancel(False)
@@ -728,6 +857,60 @@ def calibrate_s2_steps_per_rev(approach_dir=+1):
 
     print(f"[Cal] S2 saved to: {path}")
     return S2_STEPS_PER_REV
+
+
+def calibrate_s1_steps_per_rev(direction=+1, measure_step_delay=0.015):
+    """
+    Measure one full revolution of the small S1 disk using the same OPEN->BLOCKED->OPEN
+    logic as the CLI calibration menu, but preserve the global stage step counter.
+    """
+    global steps_per_rev
+
+    direction = 1 if int(direction) >= 0 else -1
+    measure_step_delay = float(measure_step_delay)
+    max_steps = max(int(abs(steps_per_rev or 0)) * 3, _legacy_steps(2000))
+
+    _log_calibration_event(f"S1 steps/rev calibration started (direction={direction:+d})")
+
+    def _s1_is_blocked():
+        state = board.digital[optical_pin].read()
+        return True if state is None else bool(state)
+
+    # Match the CLI path: first ensure we are on the S1 OPEN portion of the window.
+    steps_to_open = 0
+    while _s1_is_blocked():
+        move_stepper(seq, 1, measure_step_delay, direction)
+        steps_to_open += 1
+        if steps_to_open > max_steps:
+            raise RuntimeError("S1 calibration could not find the OPEN window.")
+
+    start_step_count = int(step_count)
+    moved_steps = 0
+    found_blocked = False
+
+    # Then measure one full OPEN -> BLOCKED -> OPEN cycle.
+    while True:
+        move_stepper(seq, 1, measure_step_delay, direction)
+        moved_steps += 1
+        state = board.digital[optical_pin].read()
+        is_blocked = True if state is None else bool(state)
+        if not found_blocked and is_blocked:
+            found_blocked = True
+        if found_blocked and not is_blocked:
+            break
+        if moved_steps > max_steps:
+            raise RuntimeError("S1 calibration did not complete a full OPEN->BLOCKED->OPEN cycle.")
+
+    measured = abs(int(step_count) - start_step_count)
+    if measured <= 0:
+        raise RuntimeError("S1 calibration produced an invalid zero-length revolution.")
+
+    steps_per_rev = int(measured)
+    path = save_cal(STATE_DIR, s1_steps_per_rev=steps_per_rev)
+    print(f"[Cal] S1 steps/rev = {steps_per_rev}")
+    print(f"[Cal] S1 saved to: {path}")
+    _log_calibration_event(f"S1 steps/rev calibration saved: steps_per_rev={steps_per_rev}")
+    return steps_per_rev
 
 
 FAR_STEP_THRESHOLD_MOVE = _legacy_steps(600)   # if farther than this, sprint at FAST_STEP_DELAY
@@ -1587,6 +1770,73 @@ def _load_numpy():
     except Exception as e:
         raise RuntimeError("NumPy is required for ZWO-assisted capture. Install it with: pip install numpy") from e
 
+def _candidate_zwo_sdk_paths():
+    candidates = []
+    env_path = os.getenv("ZWO_ASI_LIB")
+    if env_path:
+        candidates.append(env_path)
+
+    home = Path.home()
+    candidates.extend(
+        [
+            "/Applications/ASIStudio.app/Contents/Frameworks/libASICamera2.dylib",
+            str(home / "Applications" / "ASIStudio.app" / "Contents" / "Frameworks" / "libASICamera2.dylib"),
+            "/usr/local/lib/libASICamera2.dylib",
+            "/opt/homebrew/lib/libASICamera2.dylib",
+        ]
+    )
+    for base_dir in (home / "Downloads", home / "Desktop", home / "Documents"):
+        if not base_dir.exists():
+            continue
+        try:
+            for found in base_dir.rglob("libASICamera2*.dylib"):
+                candidates.append(str(found))
+        except Exception:
+            continue
+    return candidates
+
+def _zwo_sdk_supports_current_arch(path):
+    if platform.system() != "Darwin":
+        return True
+
+    target_arch = platform.machine().lower()
+    if not target_arch:
+        return True
+
+    for probe_cmd in (["lipo", "-info", path], ["file", path]):
+        try:
+            result = subprocess.run(probe_cmd, capture_output=True, text=True, check=False)
+        except Exception:
+            continue
+        text = f"{result.stdout}\n{result.stderr}".lower()
+        if not text.strip():
+            continue
+        if target_arch.startswith("arm64"):
+            return ("arm64" in text) or ("arm64e" in text)
+        if target_arch == "x86_64":
+            return "x86_64" in text
+        return True
+    return True
+
+def _find_zwo_sdk_path(explicit_path=None, *, compatible_only=False):
+    seen = set()
+    for candidate in ([explicit_path] if explicit_path else []) + _candidate_zwo_sdk_paths():
+        if not candidate:
+            continue
+        try:
+            resolved = str(Path(candidate).expanduser())
+        except Exception:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not Path(resolved).exists():
+            continue
+        if compatible_only and not _zwo_sdk_supports_current_arch(resolved):
+            continue
+        return resolved
+    return None
+
 def _load_zwoasi(lib_path=None):
     try:
         import zwoasi as asi
@@ -1596,7 +1846,7 @@ def _load_zwoasi(lib_path=None):
         ) from e
 
     if not getattr(_load_zwoasi, "_initialized", False):
-        sdk_path = lib_path or os.getenv("ZWO_ASI_LIB")
+        sdk_path = _find_zwo_sdk_path(lib_path) if lib_path else _find_zwo_sdk_path(compatible_only=True)
         try:
             if sdk_path:
                 asi.init(sdk_path)
@@ -1607,9 +1857,28 @@ def _load_zwoasi(lib_path=None):
                 raise RuntimeError("Set ZWO_ASI_LIB to the ASICamera2 SDK library path before using the ZWO routine.")
             asi.init(sdk_path)
         except Exception as e:
+            err_text = str(e)
+            if sdk_path and "missing compatible architecture" in err_text.lower():
+                raise RuntimeError(
+                    f"The ZWO SDK at '{sdk_path}' is not compatible with this Python runtime. "
+                    f"Current Python architecture: {platform.machine()}. "
+                    "The SDK library appears to be Intel-only (x86_64/i386), while this process is running as Apple Silicon "
+                    "(arm64). Use an arm64 build of libASICamera2.dylib, or run the entire GUI under an x86_64 Python/Rosetta environment."
+                ) from e
             if sdk_path:
                 raise RuntimeError(f"Could not initialize ASICamera2 SDK from '{sdk_path}': {e}") from e
-            raise RuntimeError("Could not initialize the ZWO ASI SDK. Set ZWO_ASI_LIB to the ASICamera2 SDK library path.") from e
+            tried = ", ".join(_candidate_zwo_sdk_paths())
+            first_existing = _find_zwo_sdk_path()
+            arch_hint = ""
+            if first_existing and not _zwo_sdk_supports_current_arch(first_existing):
+                arch_hint = (
+                    f" Found an existing SDK at '{first_existing}', but it is not compatible with "
+                    f"the current Python architecture ({platform.machine()})."
+                )
+            raise RuntimeError(
+                "Could not initialize the ZWO ASI SDK. Set ZWO_ASI_LIB or the GUI SDK path field to "
+                f"libASICamera2.dylib. Tried: {tried}.{arch_hint}"
+            ) from e
         _load_zwoasi._initialized = True
 
     return asi
@@ -1646,6 +1915,113 @@ def _zwo_open_camera(camera_index=0, exposure_ms=10.0, gain=0, lib_path=None):
         pass
 
     return asi, camera
+
+def _zwo_camera_property_dict(asi, camera_index):
+    try:
+        prop = asi.get_camera_property(camera_index)
+        if isinstance(prop, dict):
+            return dict(prop)
+    except Exception:
+        pass
+    return {}
+
+def _zwo_list_cameras(lib_path=None):
+    asi = _load_zwoasi(lib_path=lib_path)
+    num_cameras = int(asi.get_num_cameras())
+    try:
+        listed_names = list(asi.list_cameras())
+    except Exception:
+        listed_names = []
+
+    cameras = []
+    for camera_index in range(num_cameras):
+        prop = _zwo_camera_property_dict(asi, camera_index)
+        name = None
+        if camera_index < len(listed_names):
+            name = listed_names[camera_index]
+        if not name:
+            name = prop.get("Name") or prop.get("name") or f"Camera {camera_index}"
+        max_width = prop.get("MaxWidth")
+        max_height = prop.get("MaxHeight")
+        is_color = prop.get("IsColorCam")
+        label = f"{camera_index}: {name}"
+        if max_width and max_height:
+            label += f" ({max_width}x{max_height})"
+        cameras.append(
+            {
+                "index": int(camera_index),
+                "name": str(name),
+                "label": label,
+                "max_width": int(max_width) if max_width is not None else None,
+                "max_height": int(max_height) if max_height is not None else None,
+                "is_color": bool(is_color) if is_color is not None else None,
+                "property": prop,
+            }
+        )
+    return cameras
+
+def _zwo_connected_status_payload(camera=None, *, camera_index=None, camera_name=None, sdk_path=None, exposure_ms=None, gain=None, camera_props=None):
+    payload = {
+        "sdk_path": sdk_path or os.getenv("ZWO_ASI_LIB"),
+        "connected": bool(camera is not None),
+        "camera_index": int(camera_index) if camera_index is not None else None,
+        "camera_name": camera_name,
+        "exposure_ms": float(exposure_ms) if exposure_ms is not None else None,
+        "gain": int(gain) if gain is not None else None,
+        "frame_width": None,
+        "frame_height": None,
+        "binning": None,
+        "image_type": None,
+        "roi_start_x": None,
+        "roi_start_y": None,
+        "max_width": None,
+        "max_height": None,
+        "is_color": None,
+    }
+    if camera is None:
+        return payload
+
+    props = dict(camera_props or {})
+    if not props:
+        try:
+            props = dict(camera.get_camera_property())
+        except Exception:
+            props = {}
+
+    if props:
+        payload.update(
+            {
+                "max_width": int(props.get("MaxWidth")) if props.get("MaxWidth") is not None else None,
+                "max_height": int(props.get("MaxHeight")) if props.get("MaxHeight") is not None else None,
+                "is_color": bool(props.get("IsColorCam")) if props.get("IsColorCam") is not None else None,
+            }
+        )
+
+    try:
+        width, height, binning, image_type = camera.get_roi_format()
+        payload.update(
+            {
+                "frame_width": int(width),
+                "frame_height": int(height),
+                "binning": int(binning),
+                "image_type": image_type,
+            }
+        )
+    except Exception:
+        pass
+    try:
+        start_x, start_y, width2, height2 = camera.get_roi()
+        payload.update(
+            {
+                "roi_start_x": int(start_x),
+                "roi_start_y": int(start_y),
+                "frame_width": int(width2),
+                "frame_height": int(height2),
+            }
+        )
+    except Exception:
+        pass
+    return payload
 
 def _zwo_frame_to_array(frame, camera, np):
     if hasattr(frame, "shape"):
@@ -1686,6 +2062,82 @@ def _zwo_capture_metric(camera, roi=None, average_frames=3):
         background = float(np.percentile(region, 10.0))
         metrics.append(float(np.clip(region - background, 0.0, None).sum()))
     return sum(metrics) / len(metrics)
+
+def _zwo_normalize_analysis_roi(arr, roi):
+    if roi is None:
+        return None
+    height, width = arr.shape[:2]
+    if width <= 0 or height <= 0:
+        return None
+    x, y, roi_w, roi_h = [int(v) for v in roi]
+    x = max(0, min(x, width - 1))
+    y = max(0, min(y, height - 1))
+    roi_w = max(1, min(roi_w, width - x))
+    roi_h = max(1, min(roi_h, height - y))
+    if x == 0 and y == 0 and roi_w == width and roi_h == height:
+        return None
+    return (x, y, roi_w, roi_h)
+
+def _zwo_profile_analysis(arr, *, axis="x", roi=None, feature="centroid"):
+    np = _load_numpy()
+    if axis not in ("x", "y"):
+        raise ValueError("axis must be 'x' or 'y'")
+    if feature not in ("centroid", "peak"):
+        raise ValueError("feature must be 'centroid' or 'peak'")
+
+    roi = _zwo_normalize_analysis_roi(arr, roi)
+    frame_h, frame_w = arr.shape[:2]
+    if roi is None:
+        x = 0
+        y = 0
+        roi_w = frame_w
+        roi_h = frame_h
+    else:
+        x, y, roi_w, roi_h = roi
+
+    region = arr[y : y + roi_h, x : x + roi_w]
+    if region.size == 0:
+        raise RuntimeError("Selected analysis ROI is empty.")
+
+    region_f = region.astype(np.float64, copy=False)
+    profile = region_f.sum(axis=0 if axis == "x" else 1)
+    if profile.size == 0:
+        raise RuntimeError("Profile computation produced no samples.")
+
+    peak_index = int(np.argmax(profile))
+    peak_value = float(profile[peak_index])
+    integrated_intensity = float(profile.sum())
+    centroid_index = None
+    if integrated_intensity > 0.0:
+        coords = np.arange(profile.size, dtype=np.float64)
+        centroid_index = float((coords * profile).sum() / integrated_intensity)
+
+    if feature == "centroid":
+        feature_position = centroid_index if centroid_index is not None else float(peak_index)
+    else:
+        feature_position = float(peak_index)
+
+    target_index = 0.5 * float(profile.size - 1)
+    feature_sensor_position = (x + feature_position) if axis == "x" else (y + feature_position)
+
+    return {
+        "axis": axis,
+        "feature": feature,
+        "roi": {"x": int(x), "y": int(y), "width": int(roi_w), "height": int(roi_h)},
+        "profile_length": int(profile.size),
+        "profile": profile.tolist(),
+        "peak_index": int(peak_index),
+        "peak_value": float(peak_value),
+        "centroid_index": None if centroid_index is None else float(centroid_index),
+        "feature_position": None if feature_position is None else float(feature_position),
+        "feature_sensor_position": None if feature_position is None else float(feature_sensor_position),
+        "target_index": float(target_index),
+        "error_px": None if feature_position is None else float(target_index - feature_position),
+        "integrated_intensity": float(integrated_intensity),
+        "mean_dn": float(region_f.mean()),
+        "region_width": int(roi_w),
+        "region_height": int(roi_h),
+    }
 
 def zwo_assisted_reference_capture():
     try:
@@ -1859,6 +2311,176 @@ def zwo_assisted_reference_capture():
             )
     except Exception as e:
         print(f"[ZWO] Fit failed: {e}")
+
+def zwo_assisted_reference_capture_with_params(
+    *,
+    lambda_nm,
+    order_m,
+    premove=False,
+    mode="from_home_ccw",
+    half_width_steps,
+    step_size_steps,
+    settle_s=0.05,
+    average_frames=3,
+    camera_index=0,
+    exposure_ms=10.0,
+    gain=0,
+    lib_path=None,
+    roi=None,
+    move_to_peak=True,
+    fit_mode="skip",
+):
+    lam = float(lambda_nm)
+    order_m = int(order_m)
+    if order_m == 0:
+        raise ValueError("order m must be nonzero")
+
+    half_width_steps = int(half_width_steps)
+    step_size_steps = int(step_size_steps)
+    if half_width_steps <= 0 or step_size_steps <= 0:
+        raise ValueError("Scan width and step size must be positive integers.")
+    if step_size_steps > half_width_steps:
+        raise ValueError("Scan step size must be <= scan half-width.")
+
+    settle_s = float(settle_s)
+    average_frames = max(1, int(average_frames))
+    camera_index = int(camera_index)
+    exposure_ms = float(exposure_ms)
+    gain = int(gain)
+    lib_path = lib_path or None
+    roi = _parse_roi(roi) if isinstance(roi, str) and roi.strip() else roi
+
+    if premove:
+        print(f"[ZWO] Moving near λ={lam} nm, m={order_m} using the current wavelength model...")
+        move_to_wavelength_nonlinear(lam, order_m, mode=mode)
+
+    center_steps = int(step_count)
+    start_steps = center_steps - half_width_steps
+    total_points = (2 * half_width_steps) // step_size_steps + 1
+    sample_steps = []
+    sample_metrics = []
+    camera = None
+    _log_calibration_event(
+        f"ZWO scan start: lambda={lam} nm, order={order_m}, center_step={center_steps}, "
+        f"half_width={half_width_steps}, step_size={step_size_steps}, roi={roi}"
+    )
+
+    try:
+        _, camera = _zwo_open_camera(
+            camera_index=camera_index,
+            exposure_ms=exposure_ms,
+            gain=gain,
+            lib_path=lib_path,
+        )
+        if hasattr(camera, "start_video_capture"):
+            camera.start_video_capture()
+
+        print(
+            f"[ZWO] Scanning {total_points} points over ±{half_width_steps} steps "
+            f"around step {center_steps} for λ={lam} nm, m={order_m}."
+        )
+
+        _move_to_target_steps_fixed_approach(start_steps, final_dir=+1)
+
+        for i in range(total_points):
+            _check_cancel()
+            _sleep_with_cancel(settle_s)
+            metric = _zwo_capture_metric(camera, roi=roi, average_frames=average_frames)
+            sample_steps.append(int(step_count))
+            sample_metrics.append(metric)
+            print(
+                f"[ZWO] step={step_count:6d} θ={_steps_to_theta_deg(step_count):9.6f}° "
+                f"metric={metric:12.3f}"
+            )
+            if i != total_points - 1:
+                move_biased(step_size_steps, EDGE_STEP_DELAY, +1)
+
+    finally:
+        if camera is not None:
+            try:
+                camera.stop_video_capture()
+            except Exception:
+                pass
+            try:
+                camera.close()
+            except Exception:
+                pass
+
+    peak_step, peak_idx = _quadratic_peak_center(sample_steps, sample_metrics)
+    peak_theta = _steps_to_theta_deg(peak_step)
+    peak_metric = sample_metrics[peak_idx]
+    wl_state = _wl_load(STATE_DIR)
+    refs = list(wl_state.get("refs", []))
+    saved_model = wl_state.get("model")
+    refs.append({"theta_deg": float(peak_theta), "lambda_nm": float(lam), "order_m": int(order_m)})
+    _wl_save(STATE_DIR, refs, saved_model)
+
+    print(
+        f"[ZWO] Added ref from peak fit: θ={peak_theta:.6f}°, λ={lam} nm, m={order_m} "
+        f"(peak metric≈{peak_metric:.3f})."
+    )
+    _log_calibration_event(
+        f"ZWO ref added: theta={peak_theta:.6f} deg, lambda={lam} nm, order={order_m}, peak_metric={peak_metric:.3f}"
+    )
+
+    peak_on_edge = not (0 < peak_idx < len(sample_steps) - 1)
+    if peak_on_edge:
+        print("[ZWO] Peak landed on a scan edge; widen the scan window if you want a cleaner fit.")
+
+    if move_to_peak:
+        _move_to_target_steps_fixed_approach(int(round(peak_step)), final_dir=+1)
+
+    model = None
+    rms = None
+    mx = None
+    if fit_mode == "affine":
+        a, b = _fit_littrow_linear(refs)
+        model = {"kind": "affine_littrow", "a": float(a), "b": float(b)}
+    elif fit_mode == "origin":
+        a, b = _fit_littrow_through_origin(refs)
+        model = {"kind": "affine_littrow", "a": float(a), "b": float(b)}
+    elif fit_mode == "sin_offset":
+        sin_coeff, cos_coeff = _fit_sin_cos_model(refs)
+        amplitude_nm = math.hypot(sin_coeff, cos_coeff)
+        theta0_deg = math.degrees(math.atan2(cos_coeff, sin_coeff)) if amplitude_nm else 0.0
+        model = {
+            "kind": "sin_theta_offset",
+            "amplitude_nm": float(amplitude_nm),
+            "theta0_deg": float(theta0_deg),
+        }
+    elif fit_mode == "sin_cos":
+        sin_coeff, cos_coeff = _fit_sin_cos_model(refs)
+        model = {
+            "kind": "sin_cos",
+            "sin_coeff_nm": float(sin_coeff),
+            "cos_coeff_nm": float(cos_coeff),
+        }
+
+    model_summary = None
+    if model is not None:
+        model = _normalize_wl_model(model)
+        _wl_save(STATE_DIR, refs, model)
+        res = _wl_model_residuals(refs, model)
+        rms = (sum(r*r for r in res) / len(res)) ** 0.5 if res else 0.0
+        mx = max(abs(r) for r in res) if res else 0.0
+        model_summary = _wl_model_summary(model)
+        print(f"[ZWO] Model saved. {model_summary}")
+        print(f"[ZWO] Residuals on λ/m: RMS={rms:.6f} nm, max={mx:.6f} nm")
+        _log_calibration_event(
+            f"ZWO refit saved: {model_summary}; residual_rms={rms:.6f} nm, residual_max={mx:.6f} nm"
+        )
+
+    return {
+        "peak_step": float(peak_step),
+        "peak_theta_deg": float(peak_theta),
+        "peak_metric": float(peak_metric),
+        "points_scanned": int(total_points),
+        "peak_on_edge": bool(peak_on_edge),
+        "refs_count": len(refs),
+        "model_summary": model_summary,
+        "residual_rms_nm": rms,
+        "residual_max_nm": mx,
+    }
 
 
 def _log_homing_event(message):
@@ -2541,6 +3163,36 @@ def set_home():
     
     print('Total Steps, total revs, delta steps pre-rev, delta steps post-revs:', home_steps, ' ,' ,home_revs, ' ,',home_pre_rev_steps, ' ,',home_delta_steps )
 
+def save_current_as_disk_home():
+    global home_delta_steps, home_revs, home_steps, home_pre_rev_steps
+    global step_count, rev_count, transition_sequence, steps_since_rev, steps_till_rev, _seq_index
+
+    home_revs = rev_count
+    home_steps = step_count
+    home_pre_rev_steps = steps_till_rev
+    home_delta_steps = steps_since_rev
+
+    step_count = 0
+    rev_count = 0
+    steps_since_rev = 0
+    steps_till_rev = 0
+    transition_sequence = []
+    _seq_index = 0
+    _persist_step_count()
+
+    print("[Home] Current position saved as new Disk Home. Step count reset to 0.")
+    return build_state_snapshot()
+
+def save_current_as_optical_home():
+    global OPTICAL_HOME_OFFSET_STEPS
+
+    OPTICAL_HOME_OFFSET_STEPS = int(step_count)
+    _persist_optical_offset()
+    _maybe_persist_step_count(force=True)
+
+    print(f"[OpticalHome] Current position saved as optical home offset: {OPTICAL_HOME_OFFSET_STEPS:+d} steps.")
+    return build_state_snapshot()
+
 
 def _sleep_with_cancel(seconds: float, check_dt: float = 0.05):
     """Sleep in small chunks so the cancel listener can interrupt."""
@@ -3170,7 +3822,7 @@ def _load_optical_offset():
         print(f"[Persist] Could not read {OPTICAL_OFFSET_FILE} ({e}); defaulting to 0")
         OPTICAL_HOME_OFFSET_STEPS = 0
 
-def initialize_runtime(*, show_banner=True):
+def initialize_runtime(*, show_banner=True, preferred_port=None):
     """
     Initialize hardware/runtime state once so the backend can be safely imported by a GUI.
     """
@@ -3181,7 +3833,7 @@ def initialize_runtime(*, show_banner=True):
         if _runtime_initialized:
             return build_state_snapshot()
 
-        _init_board()
+        _init_board(preferred_port)
         WL = load_wl_cal(STATE_DIR)   # {"refs":[...], "model": {...} or None}
         wait_for_initial_sensor_states()
         setup_logging()
@@ -3231,6 +3883,7 @@ def build_state_snapshot(*, order_m=1):
             "optical_offset_steps": int(OPTICAL_HOME_OFFSET_STEPS),
             "home_window_open": False,
             "debug_enabled": bool(DEBUG_MOTION_LOGGING),
+            "port": None,
         }
 
     s1 = _sensor_state_label(board.digital[optical_pin].read())
@@ -3258,6 +3911,7 @@ def build_state_snapshot(*, order_m=1):
         "optical_offset_steps": int(OPTICAL_HOME_OFFSET_STEPS),
         "home_window_open": bool(s2 == "OPEN"),
         "debug_enabled": bool(DEBUG_MOTION_LOGGING),
+        "port": port,
     }
 
 class MonochromatorGUIBackend:
@@ -3266,10 +3920,47 @@ class MonochromatorGUIBackend:
     """
     def __init__(self):
         self._lock = threading.RLock()
+        self._zwo_lock = threading.RLock()
+        self._gui_jog_stop_event = None
+        self._zwo_asi = None
+        self._zwo_camera = None
+        self._zwo_camera_index = None
+        self._zwo_camera_name = None
+        self._zwo_sdk_path = None
+        self._zwo_exposure_ms = None
+        self._zwo_gain = None
+        self._zwo_camera_props = None
 
-    def initialize(self):
+    def _disconnect_zwo_locked(self):
+        if self._zwo_camera is not None:
+            try:
+                self._zwo_camera.stop_video_capture()
+            except Exception:
+                pass
+            try:
+                self._zwo_camera.stop_exposure()
+            except Exception:
+                pass
+            try:
+                self._zwo_camera.close()
+            except Exception:
+                pass
+        self._zwo_asi = None
+        self._zwo_camera = None
+        self._zwo_camera_index = None
+        self._zwo_camera_name = None
+        self._zwo_sdk_path = None
+        self._zwo_exposure_ms = None
+        self._zwo_gain = None
+        self._zwo_camera_props = None
+
+    def list_ports(self):
         with self._lock:
-            return initialize_runtime(show_banner=False)
+            return list_available_serial_ports()
+
+    def initialize(self, preferred_port=None):
+        with self._lock:
+            return initialize_runtime(show_banner=False, preferred_port=preferred_port)
 
     def status(self):
         with self._lock:
@@ -3291,11 +3982,43 @@ class MonochromatorGUIBackend:
                 _set_cancel(False)
             return build_state_snapshot()
 
+    def _run_with_result(self, fn, *args, **kwargs):
+        with self._lock:
+            initialize_runtime(show_banner=False)
+            _set_cancel(False)
+            try:
+                value = fn(*args, **kwargs)
+            except _QuitToMain as e:
+                raise RuntimeError("Operation cancelled") from e
+            finally:
+                _set_cancel(False)
+            result = build_state_snapshot()
+            result["_result"] = value
+            return result
+
     def set_jog_speed_ms(self, ms):
         with self._lock:
             initialize_runtime(show_banner=False)
             _set_step_delay_ms(ms, persist=True)
             return build_state_snapshot()
+
+    def run_cli_jog_mode(self):
+        stop_event = threading.Event()
+        with self._lock:
+            initialize_runtime(show_banner=False)
+            _set_cancel(False)
+            self._gui_jog_stop_event = stop_event
+            try:
+                gui_cli_jog_mode(stop_event=stop_event)
+            finally:
+                self._gui_jog_stop_event = None
+                _set_cancel(False)
+            return build_state_snapshot()
+
+    def stop_cli_jog_mode(self):
+        stop_event = self._gui_jog_stop_event
+        if stop_event is not None:
+            stop_event.set()
 
     def jog_step(self, direction, steps=1):
         steps = int(steps)
@@ -3319,11 +4042,511 @@ class MonochromatorGUIBackend:
     def move_to_wavelength(self, wavelength_nm, order_m, mode="from_home_ccw"):
         return self._run(move_to_wavelength_nonlinear, float(wavelength_nm), int(order_m), mode)
 
+    def calibrate_s1(self):
+        def _do():
+            measured = calibrate_s1_steps_per_rev(direction=+1)
+            ok, err = check_step_integrity()
+            return {
+                "measured_steps_per_rev": int(measured),
+                "integrity_ok": bool(ok),
+                "integrity_error_steps": int(err),
+                "s1_estimated_step_count": int(estimate_steps_from_S1()),
+            }
+        return self._run_with_result(_do)
+
+    def get_s1_calibration_status(self):
+        with self._lock:
+            initialize_runtime(show_banner=False)
+            ok, err = check_step_integrity()
+            result = build_state_snapshot()
+            result.update(
+                {
+                    "s1_steps_per_rev": int(steps_per_rev) if steps_per_rev is not None else None,
+                    "rev_count": int(rev_count),
+                    "steps_since_rev": int(steps_since_rev),
+                    "steps_till_rev": int(steps_till_rev),
+                    "pre_rev_steps": int(pre_rev_steps),
+                    "post_rev_steps": int(post_rev_steps),
+                    "edge_holdoff_steps": int(EDGE_HOLDOFF_STEPS),
+                    "s1_estimated_step_count": int(estimate_steps_from_S1()),
+                    "integrity_ok": bool(ok),
+                    "integrity_error_steps": int(err),
+                }
+            )
+            return result
+
+    def list_zwo_cameras(self, lib_path=None):
+        with self._zwo_lock:
+            lib_path = lib_path or None
+            cameras = _zwo_list_cameras(lib_path=lib_path)
+            return {
+                "sdk_path": lib_path or os.getenv("ZWO_ASI_LIB"),
+                "camera_count": len(cameras),
+                "cameras": cameras,
+            }
+
+    def connect_zwo_camera(self, camera_index=0, exposure_ms=10.0, gain=0, lib_path=None):
+        with self._zwo_lock:
+            lib_path = lib_path or None
+            self._disconnect_zwo_locked()
+            asi, camera = _zwo_open_camera(
+                camera_index=int(camera_index),
+                exposure_ms=float(exposure_ms),
+                gain=int(gain),
+                lib_path=lib_path,
+            )
+            if hasattr(camera, "start_video_capture"):
+                try:
+                    camera.start_video_capture()
+                except Exception:
+                    pass
+
+            camera_props = _zwo_camera_property_dict(asi, int(camera_index))
+            camera_name = camera_props.get("Name") or camera_props.get("name") or f"Camera {int(camera_index)}"
+
+            self._zwo_asi = asi
+            self._zwo_camera = camera
+            self._zwo_camera_index = int(camera_index)
+            self._zwo_camera_name = str(camera_name)
+            self._zwo_sdk_path = lib_path or os.getenv("ZWO_ASI_LIB")
+            self._zwo_exposure_ms = float(exposure_ms)
+            self._zwo_gain = int(gain)
+            self._zwo_camera_props = camera_props
+            return _zwo_connected_status_payload(
+                self._zwo_camera,
+                camera_index=self._zwo_camera_index,
+                camera_name=self._zwo_camera_name,
+                sdk_path=self._zwo_sdk_path,
+                exposure_ms=self._zwo_exposure_ms,
+                gain=self._zwo_gain,
+                camera_props=self._zwo_camera_props,
+            )
+
+    def disconnect_zwo_camera(self):
+        with self._zwo_lock:
+            self._disconnect_zwo_locked()
+            return _zwo_connected_status_payload(None)
+
+    def get_zwo_camera_status(self):
+        with self._zwo_lock:
+            return _zwo_connected_status_payload(
+                self._zwo_camera,
+                camera_index=self._zwo_camera_index,
+                camera_name=self._zwo_camera_name,
+                sdk_path=self._zwo_sdk_path,
+                exposure_ms=self._zwo_exposure_ms,
+                gain=self._zwo_gain,
+                camera_props=self._zwo_camera_props,
+            )
+
+    def set_zwo_camera_settings(self, exposure_ms=None, gain=None):
+        with self._zwo_lock:
+            if self._zwo_camera is None:
+                raise RuntimeError("No ZWO camera is connected.")
+            if exposure_ms is not None:
+                self._zwo_camera.set_control_value(self._zwo_asi.ASI_EXPOSURE, int(round(float(exposure_ms) * 1000.0)))
+                self._zwo_exposure_ms = float(exposure_ms)
+            if gain is not None:
+                self._zwo_camera.set_control_value(self._zwo_asi.ASI_GAIN, int(gain))
+                self._zwo_gain = int(gain)
+            return _zwo_connected_status_payload(
+                self._zwo_camera,
+                camera_index=self._zwo_camera_index,
+                camera_name=self._zwo_camera_name,
+                sdk_path=self._zwo_sdk_path,
+                exposure_ms=self._zwo_exposure_ms,
+                gain=self._zwo_gain,
+                camera_props=self._zwo_camera_props,
+            )
+
+    def _capture_zwo_frame_payload_locked(self, *, include_stats=True):
+        if self._zwo_camera is None:
+            raise RuntimeError("No ZWO camera is connected.")
+        np = _load_numpy()
+        frame = None
+        if hasattr(self._zwo_camera, "capture_video_frame"):
+            try:
+                frame = self._zwo_camera.capture_video_frame()
+            except Exception:
+                frame = None
+        if frame is None and hasattr(self._zwo_camera, "capture"):
+            frame = self._zwo_camera.capture()
+        if frame is None:
+            raise RuntimeError("Could not capture a frame from the connected ZWO camera.")
+        arr = _zwo_frame_to_array(frame, self._zwo_camera, np)
+        arr = np.ascontiguousarray(arr.copy())
+        payload = {
+            "status": _zwo_connected_status_payload(
+                self._zwo_camera,
+                camera_index=self._zwo_camera_index,
+                camera_name=self._zwo_camera_name,
+                sdk_path=self._zwo_sdk_path,
+                exposure_ms=self._zwo_exposure_ms,
+                gain=self._zwo_gain,
+                camera_props=self._zwo_camera_props,
+            ),
+            "frame_width": int(arr.shape[1]),
+            "frame_height": int(arr.shape[0]),
+            "frame_array": arr,
+        }
+        if include_stats:
+            payload.update(
+                {
+                    "frame_min": int(arr.min()),
+                    "frame_max": int(arr.max()),
+                    "frame_mean": float(arr.mean()),
+                }
+            )
+        return payload
+
+    def capture_zwo_single_frame(self):
+        with self._zwo_lock:
+            return self._capture_zwo_frame_payload_locked(include_stats=True)
+
+    def capture_zwo_live_frame(self):
+        with self._zwo_lock:
+            return self._capture_zwo_frame_payload_locked(include_stats=False)
+
+    def center_zwo_feature(self, feature="centroid", axis="x", analysis_roi=None, tolerance_px=2.0, max_steps=40, settle_ms=25.0):
+        feature = str(feature).strip().lower()
+        axis = str(axis).strip().lower()
+        tolerance_px = max(0.0, float(tolerance_px))
+        max_steps = max(1, int(max_steps))
+        settle_s = max(0.0, float(settle_ms) / 1000.0)
+        analysis_roi_tuple = None if analysis_roi is None else tuple(int(v) for v in analysis_roi)
+
+        with self._lock:
+            initialize_runtime(show_banner=False)
+            _set_cancel(False)
+            try:
+                with self._zwo_lock:
+                    if self._zwo_camera is None:
+                        raise RuntimeError("No ZWO camera is connected.")
+
+                    def capture_analysis_payload():
+                        payload = self._capture_zwo_frame_payload_locked(include_stats=True)
+                        payload["analysis"] = _zwo_profile_analysis(
+                            payload["frame_array"],
+                            axis=axis,
+                            roi=analysis_roi_tuple,
+                            feature=feature,
+                        )
+                        return payload
+
+                    initial_payload = capture_analysis_payload()
+                    initial_analysis = initial_payload["analysis"]
+                    initial_position = initial_analysis.get("feature_position")
+                    if initial_position is None:
+                        raise RuntimeError(f"Could not locate a usable {feature} in the selected ROI.")
+
+                    initial_error = float(initial_analysis["target_index"] - initial_position)
+                    if abs(initial_error) <= tolerance_px:
+                        result = dict(initial_payload)
+                        result.update(
+                            {
+                                "feature": feature,
+                                "axis": axis,
+                                "converged": True,
+                                "iterations_used": 0,
+                                "steps_moved_net": 0,
+                                "initial_error_px": float(initial_error),
+                                "final_error_px": float(initial_error),
+                                "probe_shift_per_cw_step": 0.0,
+                                "tolerance_px": float(tolerance_px),
+                            }
+                        )
+                        snapshot = build_state_snapshot()
+                        snapshot["_result"] = result
+                        return snapshot
+
+                    probe_plus_payload = None
+                    move_exact(1, step_delay, +1)
+                    try:
+                        if settle_s > 0.0:
+                            time.sleep(settle_s)
+                        probe_plus_payload = capture_analysis_payload()
+                    finally:
+                        move_exact(1, step_delay, -1)
+                        if settle_s > 0.0:
+                            time.sleep(settle_s)
+
+                    probe_position = probe_plus_payload["analysis"].get("feature_position")
+                    if probe_position is None:
+                        raise RuntimeError(f"The {feature} disappeared during the direction probe.")
+                    probe_shift = float(probe_position - initial_position)
+                    if abs(probe_shift) < 0.05:
+                        raise RuntimeError(
+                            "Could not infer how motor motion shifts the line on the camera. "
+                            "Try a tighter ROI, more exposure, or a stronger line."
+                        )
+
+                    current_payload = initial_payload
+                    iterations_used = 0
+                    steps_moved_net = 0
+                    converged = False
+
+                    for _ in range(max_steps):
+                        current_analysis = current_payload["analysis"]
+                        current_position = current_analysis.get("feature_position")
+                        if current_position is None:
+                            raise RuntimeError(f"The {feature} could not be located during centering.")
+                        current_error = float(current_analysis["target_index"] - current_position)
+                        if abs(current_error) <= tolerance_px:
+                            converged = True
+                            break
+
+                        direction = +1 if (current_error / probe_shift) > 0 else -1
+                        move_exact(1, step_delay, direction)
+                        steps_moved_net += int(direction)
+                        iterations_used += 1
+                        if settle_s > 0.0:
+                            time.sleep(settle_s)
+                        current_payload = capture_analysis_payload()
+
+                    final_analysis = current_payload["analysis"]
+                    final_position = final_analysis.get("feature_position")
+                    if final_position is None:
+                        raise RuntimeError(f"The {feature} could not be located at the final position.")
+
+                    final_error = float(final_analysis["target_index"] - final_position)
+                    converged = converged or (abs(final_error) <= tolerance_px)
+
+                    result = dict(current_payload)
+                    result.update(
+                        {
+                            "feature": feature,
+                            "axis": axis,
+                            "converged": bool(converged),
+                            "iterations_used": int(iterations_used),
+                            "steps_moved_net": int(steps_moved_net),
+                            "initial_error_px": float(initial_error),
+                            "final_error_px": float(final_error),
+                            "probe_shift_per_cw_step": float(probe_shift),
+                            "tolerance_px": float(tolerance_px),
+                        }
+                    )
+                    snapshot = build_state_snapshot()
+                    snapshot["_result"] = result
+                    return snapshot
+            finally:
+                _set_cancel(False)
+
+    def set_zwo_camera_roi(self, start_x, start_y, width, height):
+        with self._zwo_lock:
+            if self._zwo_camera is None:
+                raise RuntimeError("No ZWO camera is connected.")
+            start_x = int(start_x)
+            start_y = int(start_y)
+            width = int(width)
+            height = int(height)
+            if width <= 0 or height <= 0:
+                raise ValueError("ROI width and height must be positive.")
+
+            was_streaming = False
+            try:
+                self._zwo_camera.stop_video_capture()
+                was_streaming = True
+            except Exception:
+                pass
+
+            try:
+                _, _, current_bins, current_image_type = self._zwo_camera.get_roi_format()
+                self._zwo_camera.set_roi(
+                    start_x=start_x,
+                    start_y=start_y,
+                    width=width,
+                    height=height,
+                    bins=current_bins,
+                    image_type=current_image_type,
+                )
+            finally:
+                if was_streaming and hasattr(self._zwo_camera, "start_video_capture"):
+                    try:
+                        self._zwo_camera.start_video_capture()
+                    except Exception:
+                        pass
+
+            return _zwo_connected_status_payload(
+                self._zwo_camera,
+                camera_index=self._zwo_camera_index,
+                camera_name=self._zwo_camera_name,
+                sdk_path=self._zwo_sdk_path,
+                exposure_ms=self._zwo_exposure_ms,
+                gain=self._zwo_gain,
+                camera_props=self._zwo_camera_props,
+            )
+
+    def reset_zwo_camera_roi(self):
+        with self._zwo_lock:
+            if self._zwo_camera is None:
+                raise RuntimeError("No ZWO camera is connected.")
+            props = dict(self._zwo_camera_props or {})
+            if not props:
+                props = dict(self._zwo_camera.get_camera_property())
+                self._zwo_camera_props = props
+            max_width = int(props.get("MaxWidth"))
+            max_height = int(props.get("MaxHeight"))
+            full_width = max_width - (max_width % 8)
+            full_height = max_height - (max_height % 2)
+        return self.set_zwo_camera_roi(0, 0, full_width, full_height)
+
+    def calibrate_s2(self, approach_dir=+1):
+        def _do():
+            measured = calibrate_s2_steps_per_rev(int(approach_dir))
+            rehome_ok = bool(go_home2())
+            _ensure_steps_per_deg()
+            ok, err = check_step_integrity()
+            return {
+                "measured_steps_per_rev": int(measured),
+                "rehome_ok": rehome_ok,
+                "integrity_ok": bool(ok),
+                "integrity_error_steps": int(err),
+                "steps_per_deg": float(STEPS_PER_DEG),
+            }
+        return self._run_with_result(_do)
+
+    def get_s2_calibration_status(self):
+        with self._lock:
+            initialize_runtime(show_banner=False)
+            _ensure_steps_per_deg()
+            ok, err = check_step_integrity()
+            result = build_state_snapshot()
+            result.update(
+                {
+                    "s2_steps_per_rev": int(S2_STEPS_PER_REV) if S2_STEPS_PER_REV is not None else None,
+                    "steps_per_deg": float(STEPS_PER_DEG) if STEPS_PER_DEG is not None else None,
+                    "integrity_ok": bool(ok),
+                    "integrity_error_steps": int(err),
+                }
+            )
+            return result
+
     def go_disk_home(self):
         return self._run(go_home2)
 
+    def reset_disk_home_here(self):
+        with self._lock:
+            initialize_runtime(show_banner=False)
+            return save_current_as_disk_home()
+
     def go_optical_home(self):
         return self._run(go_optical_home)
+
+    def reset_optical_home_here(self):
+        with self._lock:
+            initialize_runtime(show_banner=False)
+            return save_current_as_optical_home()
+
+    def get_wavelength_calibration_status(self):
+        with self._lock:
+            initialize_runtime(show_banner=False)
+            wl = _wl_load(STATE_DIR)
+            refs = list(wl.get("refs", []))
+            raw_model = wl.get("model")
+            model = _normalize_wl_model(raw_model)
+            residuals = _wl_model_residuals(refs, model) if refs else []
+            result = build_state_snapshot()
+            result.update(
+                {
+                    "refs": refs,
+                    "refs_count": len(refs),
+                    "model": raw_model,
+                    "normalized_model": model,
+                    "model_summary": _wl_model_summary(model) if raw_model is not None else None,
+                    "uses_ideal_fallback": raw_model is None,
+                    "residual_rms_nm": ((sum(r*r for r in residuals) / len(residuals)) ** 0.5) if residuals else None,
+                    "residual_max_nm": (max(abs(r) for r in residuals) if residuals else None),
+                    "backup_available": os.path.exists(os.path.join(STATE_DIR, "wavelength_cal_backup.json")),
+                }
+            )
+            return result
+
+    def add_wavelength_ref_current_angle(self, lambda_nm, order_m):
+        def _do():
+            wl = _wl_load(STATE_DIR)
+            refs = list(wl.get("refs", []))
+            model = wl.get("model")
+            theta_now = float(_steps_to_theta_deg(step_count))
+            refs.append({"theta_deg": theta_now, "lambda_nm": float(lambda_nm), "order_m": int(order_m)})
+            _wl_save(STATE_DIR, refs, model)
+            _log_calibration_event(
+                f"Wavelength ref added from current angle: theta={theta_now:.6f} deg, lambda={float(lambda_nm)} nm, order={int(order_m)}"
+            )
+            return {"theta_deg": theta_now, "lambda_nm": float(lambda_nm), "order_m": int(order_m)}
+        return self._run_with_result(_do)
+
+    def add_wavelength_ref_entered_angle(self, theta_deg, lambda_nm, order_m):
+        def _do():
+            wl = _wl_load(STATE_DIR)
+            refs = list(wl.get("refs", []))
+            model = wl.get("model")
+            ref = {"theta_deg": float(theta_deg), "lambda_nm": float(lambda_nm), "order_m": int(order_m)}
+            refs.append(ref)
+            _wl_save(STATE_DIR, refs, model)
+            _log_calibration_event(
+                f"Wavelength ref added by entry: theta={float(theta_deg):.6f} deg, lambda={float(lambda_nm)} nm, order={int(order_m)}"
+            )
+            return ref
+        return self._run_with_result(_do)
+
+    def fit_wavelength_model(self, fit_kind):
+        def _do():
+            wl = _wl_load(STATE_DIR)
+            refs = list(wl.get("refs", []))
+            if fit_kind == "affine":
+                a, b = _fit_littrow_linear(refs)
+                model = {"kind": "affine_littrow", "a": float(a), "b": float(b)}
+            elif fit_kind == "origin":
+                a, b = _fit_littrow_through_origin(refs)
+                model = {"kind": "affine_littrow", "a": float(a), "b": float(b)}
+            elif fit_kind == "sin_offset":
+                sin_coeff, cos_coeff = _fit_sin_cos_model(refs)
+                amplitude_nm = math.hypot(sin_coeff, cos_coeff)
+                theta0_deg = math.degrees(math.atan2(cos_coeff, sin_coeff)) if amplitude_nm else 0.0
+                model = {
+                    "kind": "sin_theta_offset",
+                    "amplitude_nm": float(amplitude_nm),
+                    "theta0_deg": float(theta0_deg),
+                }
+            elif fit_kind == "sin_cos":
+                sin_coeff, cos_coeff = _fit_sin_cos_model(refs)
+                model = {
+                    "kind": "sin_cos",
+                    "sin_coeff_nm": float(sin_coeff),
+                    "cos_coeff_nm": float(cos_coeff),
+                }
+            else:
+                raise ValueError(f"Unknown fit kind: {fit_kind}")
+
+            model = _normalize_wl_model(model)
+            _wl_save(STATE_DIR, refs, model)
+            residuals = _wl_model_residuals(refs, model)
+            rms = (sum(r*r for r in residuals) / len(residuals)) ** 0.5 if residuals else None
+            mx = max(abs(r) for r in residuals) if residuals else None
+            _log_calibration_event(f"Wavelength model fit saved: {_wl_model_summary(model)}")
+            return {
+                "model": model,
+                "model_summary": _wl_model_summary(model),
+                "residual_rms_nm": rms,
+                "residual_max_nm": mx,
+            }
+        return self._run_with_result(_do)
+
+    def restore_wavelength_backup(self):
+        def _do():
+            restore_wl_from_backup()
+            return self.get_wavelength_calibration_status()
+        return self._run_with_result(_do)
+
+    def clear_wavelength_calibration(self):
+        def _do():
+            _wl_save(STATE_DIR, [], None)
+            _log_calibration_event("Cleared all wavelength references and model")
+            return {"refs_count": 0}
+        return self._run_with_result(_do)
+
+    def zwo_assisted_reference_capture_gui(self, **kwargs):
+        return self._run_with_result(zwo_assisted_reference_capture_with_params, **kwargs)
 
     def scan_wavelength(self, lam1, lam2, order_m, step_nm, **kwargs):
         return self._run(
@@ -3347,7 +4570,9 @@ class MonochromatorGUIBackend:
     def shutdown(self):
         global board, it, port, switch1, switch2, last_states, _runtime_initialized
         _set_cancel(True)
+        self.stop_cli_jog_mode()
         with self._lock:
+            self._disconnect_zwo_locked()
             if board is None:
                 _runtime_initialized = False
                 return
