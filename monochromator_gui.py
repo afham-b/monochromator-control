@@ -65,7 +65,7 @@ class ZWOLivePreviewThread(QThread):
     frame_ready = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, backend, fps=5.0):
+    def __init__(self, backend, fps=30.0):
         super().__init__()
         self._backend = backend
         self._fps = max(0.5, float(fps))
@@ -537,16 +537,38 @@ class MonochromatorWindow(QMainWindow):
         self.workspace_tabs.addTab(self._wrap_workspace_page(self._build_control_tab()), "Control")
         self.workspace_tabs.addTab(self._wrap_workspace_page(self._build_calibration_group()), "Calibration")
         self.workspace_tabs.addTab(self._wrap_workspace_page(self._build_scan_group()), "Scan")
-        self.workspace_tabs.addTab(self._wrap_workspace_page(self._build_zwo_camera_tab()), "ZWO Camera")
 
         self.workspace_splitter = QSplitter(Qt.Vertical)
         self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.setHandleWidth(10)
+        self.workspace_splitter.setStyleSheet(
+            "QSplitter::handle { background: #2c2f33; } "
+            "QSplitter::handle:hover { background: #4c5258; }"
+        )
         self.workspace_splitter.addWidget(self.workspace_tabs)
         self.workspace_splitter.addWidget(self._build_log_group())
         self.workspace_splitter.setStretchFactor(0, 4)
         self.workspace_splitter.setStretchFactor(1, 1)
         self.workspace_splitter.setSizes([700, 180])
-        root.addWidget(self.workspace_splitter, 1)
+
+        self.camera_pane_scroll = self._wrap_workspace_page(self._build_zwo_camera_tab())
+        self.camera_pane_scroll.setMinimumWidth(520)
+
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(12)
+        self.main_splitter.setStyleSheet(
+            "QSplitter::handle { background: #2c2f33; } "
+            "QSplitter::handle:hover { background: #4c5258; }"
+        )
+        self.main_splitter.addWidget(self.workspace_splitter)
+        self.main_splitter.addWidget(self.camera_pane_scroll)
+        self.main_splitter.setStretchFactor(0, 35)
+        self.main_splitter.setStretchFactor(1, 65)
+        self.main_splitter.setSizes([420, 780])
+        root.addWidget(self.main_splitter, 1)
+
+        self._configure_splitter_handles()
 
         self.setCentralWidget(central)
 
@@ -555,6 +577,12 @@ class MonochromatorWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setWidget(widget)
         return scroll
+
+    def _configure_splitter_handles(self):
+        for index in range(1, self.main_splitter.count()):
+            self.main_splitter.handle(index).setCursor(Qt.SplitHCursor)
+        for index in range(1, self.workspace_splitter.count()):
+            self.workspace_splitter.handle(index).setCursor(Qt.SplitVCursor)
 
     def _build_control_tab(self):
         tab = QWidget()
@@ -597,6 +625,12 @@ class MonochromatorWindow(QMainWindow):
         self.close_button = QPushButton("Close GUI")
         self.close_button.clicked.connect(self.close)
         layout.addWidget(self.close_button)
+
+        self.camera_pane_toggle_button = QPushButton("Hide Camera Pane")
+        self.camera_pane_toggle_button.setCheckable(True)
+        self.camera_pane_toggle_button.setChecked(True)
+        self.camera_pane_toggle_button.clicked.connect(self._toggle_camera_pane)
+        layout.addWidget(self.camera_pane_toggle_button)
 
         self.connection_label = QLabel("Backend not initialized.")
         self.connection_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -883,7 +917,7 @@ class MonochromatorWindow(QMainWindow):
         self.zwo_camera_exposure_spin = QDoubleSpinBox()
         self.zwo_camera_exposure_spin.setRange(0.01, 60000.0)
         self.zwo_camera_exposure_spin.setDecimals(3)
-        self.zwo_camera_exposure_spin.setValue(10.0)
+        self.zwo_camera_exposure_spin.setValue(50.0)
         self.zwo_camera_exposure_spin.setKeyboardTracking(False)
         self.zwo_camera_exposure_spin.editingFinished.connect(self._apply_zwo_camera_settings_from_editor)
         capture_layout.addWidget(QLabel("Exposure (ms)"), 0, 0)
@@ -891,7 +925,7 @@ class MonochromatorWindow(QMainWindow):
 
         self.zwo_camera_gain_spin = QSpinBox()
         self.zwo_camera_gain_spin.setRange(0, 1000)
-        self.zwo_camera_gain_spin.setValue(0)
+        self.zwo_camera_gain_spin.setValue(100)
         self.zwo_camera_gain_spin.setKeyboardTracking(False)
         self.zwo_camera_gain_spin.editingFinished.connect(self._apply_zwo_camera_settings_from_editor)
         capture_layout.addWidget(QLabel("Gain"), 0, 2)
@@ -909,7 +943,7 @@ class MonochromatorWindow(QMainWindow):
         self.zwo_live_fps_spin.setRange(0.5, 120.0)
         self.zwo_live_fps_spin.setDecimals(1)
         self.zwo_live_fps_spin.setSingleStep(1.0)
-        self.zwo_live_fps_spin.setValue(5.0)
+        self.zwo_live_fps_spin.setValue(30.0)
         capture_layout.addWidget(QLabel("Target FPS"), 1, 1)
         capture_layout.addWidget(self.zwo_live_fps_spin, 1, 2)
 
@@ -1706,6 +1740,15 @@ class MonochromatorWindow(QMainWindow):
         self._log("[GUI] Arrow jog disarmed")
         self._restore_post_jog_ui()
 
+    def _toggle_camera_pane(self, checked):
+        visible = bool(checked)
+        self.camera_pane_scroll.setVisible(visible)
+        self.camera_pane_toggle_button.setText("Hide Camera Pane" if visible else "Show Camera Pane")
+        if visible:
+            self.main_splitter.setSizes([420, 780])
+        else:
+            self.main_splitter.setSizes([1, 0])
+
     def _refresh_control_states(self):
         ready = self.backend is not None
         live_active = self._zwo_live_thread is not None
@@ -1722,6 +1765,7 @@ class MonochromatorWindow(QMainWindow):
         self.refresh_button.setEnabled(bool(ready and not self._busy and not self._closing and not armed))
         self.cancel_button.setEnabled(bool(ready and not self._closing and not armed))
         self.close_button.setEnabled(bool(not self._shutdown_complete and not self._closing))
+        self.camera_pane_toggle_button.setEnabled(bool(not self._closing))
         self.arrow_jog_checkbox.setEnabled(False)
         self.cli_jog_button.setEnabled(False)
         self.stop_cli_jog_button.setEnabled(False)
@@ -1729,7 +1773,6 @@ class MonochromatorWindow(QMainWindow):
         self.workspace_tabs.setTabEnabled(0, bool(not self._closing))
         self.workspace_tabs.setTabEnabled(1, tabs_accessible)
         self.workspace_tabs.setTabEnabled(2, tabs_accessible)
-        self.workspace_tabs.setTabEnabled(3, tabs_accessible)
         if armed and self.workspace_tabs.currentIndex() != 0:
             self.workspace_tabs.setCurrentIndex(0)
         self.calibration_tabs.setEnabled(tabs_accessible)
@@ -1756,6 +1799,26 @@ class MonochromatorWindow(QMainWindow):
             self.order_spin,
             self.wavelength_mode_combo,
             self.wavelength_move_button,
+            self.scan_mode_combo,
+            self.scan_repeats_spin,
+            self.scan_pingpong,
+            self.scan_rehome,
+            self.scan_dwell_spin,
+            self.scan_lam_start,
+            self.scan_lam_end,
+            self.scan_lam_order,
+            self.scan_lam_step,
+            self.scan_lam_margin,
+            self.start_wavelength_scan_button,
+            self.scan_theta_start,
+            self.scan_theta_end,
+            self.scan_theta_step,
+            self.scan_theta_margin,
+            self.start_angle_scan_button,
+        ]:
+            widget.setEnabled(bool(idle))
+
+        for widget in [
             self.s1_calibrate_button,
             self.s1_status_button,
             self.s2_approach_combo,
@@ -1789,22 +1852,6 @@ class MonochromatorWindow(QMainWindow):
             self.zwo_roi_edit,
             self.zwo_lib_path_edit,
             self.zwo_run_button,
-            self.scan_mode_combo,
-            self.scan_repeats_spin,
-            self.scan_pingpong,
-            self.scan_rehome,
-            self.scan_dwell_spin,
-            self.scan_lam_start,
-            self.scan_lam_end,
-            self.scan_lam_order,
-            self.scan_lam_step,
-            self.scan_lam_margin,
-            self.start_wavelength_scan_button,
-            self.scan_theta_start,
-            self.scan_theta_end,
-            self.scan_theta_step,
-            self.scan_theta_margin,
-            self.start_angle_scan_button,
             self.zwo_sdk_path_edit,
             self.zwo_refresh_cameras_button,
             self.zwo_camera_combo,

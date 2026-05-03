@@ -6,6 +6,7 @@
 
 import builtins
 import os, sys, time, math, logging, platform, json
+import multiprocessing
 import subprocess
 import threading
 from collections import deque
@@ -144,6 +145,100 @@ def _pick_arduino_port(preferred=None):
         return "COM10" if platform.system() == "Windows" else "/dev/cu.usbmodem101"
     return candidates[0]["device"]
 
+ARDUINO_PROBE_SERIAL_TIMEOUT_S = 1.0
+ARDUINO_PROBE_PROCESS_TIMEOUT_S = 6.0
+ARDUINO_AUTO_PROBE_EXTRA_CANDIDATES = 2
+
+def _arduino_port_probe_worker(port_name, serial_timeout_s, result_queue):
+    local_board = None
+    try:
+        local_board = Arduino(port_name, timeout=serial_timeout_s)
+        result_queue.put({"ok": True})
+    except BaseException as e:
+        result_queue.put({"ok": False, "error": str(e)})
+    finally:
+        if local_board is not None:
+            try:
+                local_board.exit()
+            except Exception:
+                pass
+
+def _probe_arduino_port(port_name, timeout_s=ARDUINO_PROBE_PROCESS_TIMEOUT_S):
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    process = ctx.Process(
+        target=_arduino_port_probe_worker,
+        args=(port_name, ARDUINO_PROBE_SERIAL_TIMEOUT_S, result_queue),
+    )
+    process.start()
+    process.join(float(timeout_s))
+
+    if process.is_alive():
+        process.terminate()
+        process.join(1.0)
+        return False, f"Timed out after {float(timeout_s):.1f}s"
+
+    result = None
+    try:
+        if not result_queue.empty():
+            result = result_queue.get_nowait()
+    except Exception:
+        result = None
+
+    if result and result.get("ok"):
+        return True, None
+    if result and result.get("error"):
+        return False, str(result["error"])
+    if process.exitcode == 0:
+        return False, "Probe exited without returning a result."
+    return False, f"Probe process exited with code {process.exitcode}."
+
+def _candidate_arduino_ports_for_init(preferred=None):
+    if preferred:
+        return [preferred]
+
+    candidates = []
+    seen = set()
+
+    def add_candidate(device):
+        if not device or device in seen:
+            return
+        seen.add(device)
+        candidates.append(device)
+
+    scanned = list_available_serial_ports()
+    for item in scanned:
+        if int(item.get("score", 0)) > 0:
+            add_candidate(item["device"])
+    extras_added = 0
+    for item in scanned:
+        if int(item.get("score", 0)) <= 0:
+            add_candidate(item["device"])
+            extras_added += 1
+            if extras_added >= ARDUINO_AUTO_PROBE_EXTRA_CANDIDATES:
+                break
+
+    add_candidate("COM10" if platform.system() == "Windows" else "/dev/cu.usbmodem101")
+    add_candidate("COM10" if platform.system() == "Windows" else "/dev/cu.usbmodem1101")
+    return candidates
+
+def _pick_working_arduino_port(preferred=None):
+    candidates = _candidate_arduino_ports_for_init(preferred)
+    probe_errors = []
+    for candidate in candidates:
+        ok, error_text = _probe_arduino_port(candidate)
+        if ok:
+            return candidate
+        probe_errors.append(f"{candidate}: {error_text}")
+
+    detail = "\n".join(f"  - {line}" for line in probe_errors) if probe_errors else "  - No candidate ports were available."
+    raise RuntimeError(
+        "Could not find a responsive Arduino/Firmata port.\n"
+        "Please choose the correct port and try again.\n"
+        "Probe results:\n"
+        f"{detail}"
+    )
+
 # --- Board init (cross-platform, lazy for GUI safety) ---
 PORT_OVERRIDE = os.getenv("ARDUINO_PORT")  # allow manual override via env var
 port = None
@@ -167,9 +262,9 @@ def _init_board(preferred_port=None):
     if board is not None:
         return board
 
-    port = _pick_arduino_port(preferred_port or PORT_OVERRIDE)
+    port = _pick_working_arduino_port(preferred_port or PORT_OVERRIDE)
     try:
-        board = Arduino(port)
+        board = Arduino(port, timeout=ARDUINO_PROBE_SERIAL_TIMEOUT_S)
     except Exception as e:
         raise RuntimeError(
             f"Arduino initialization failed on port '{port}': {e}\n"
@@ -4085,7 +4180,7 @@ class MonochromatorGUIBackend:
                 "cameras": cameras,
             }
 
-    def connect_zwo_camera(self, camera_index=0, exposure_ms=10.0, gain=0, lib_path=None):
+    def connect_zwo_camera(self, camera_index=0, exposure_ms=50.0, gain=100, lib_path=None):
         with self._zwo_lock:
             lib_path = lib_path or None
             self._disconnect_zwo_locked()
