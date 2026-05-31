@@ -1,4 +1,5 @@
 import os
+import math
 import sys
 import time
 import traceback
@@ -9,8 +10,8 @@ except ImportError:
     np = None
 
 try:
-    from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QThread, QTimer, Qt, Signal
-    from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
+    from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, QThread, QTimer, Qt, Signal
+    from PySide6.QtGui import QColor, QFontMetrics, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
     from PySide6.QtWidgets import (
         QAbstractSpinBox,
         QApplication,
@@ -30,6 +31,8 @@ try:
         QPlainTextEdit,
         QPushButton,
         QScrollArea,
+        QSizePolicy,
+        QSlider,
         QSpinBox,
         QSplitter,
         QTabWidget,
@@ -219,6 +222,46 @@ class CLIJogDialog(QDialog):
         event.accept()
 
 
+class ElidedStatusLabel(QLabel):
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._full_text = text or ""
+        self.setWordWrap(False)
+        self.setMinimumHeight(24)
+        self.setMaximumHeight(24)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setToolTip(self._full_text)
+
+    def setText(self, text):
+        self._full_text = text or ""
+        self.setToolTip(self._full_text)
+        super().setText(self._full_text)
+        self.update()
+
+    def sizeHint(self):
+        base = super().sizeHint()
+        return QSize(260, base.height())
+
+    def minimumSizeHint(self):
+        base = super().minimumSizeHint()
+        return QSize(120, base.height())
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        metrics = QFontMetrics(self.font())
+        text = metrics.elidedText(self._full_text, Qt.ElideRight, max(0, self.width() - 4))
+        painter.drawText(self.rect().adjusted(2, 0, -2, 0), self.alignment(), text)
+
+
+def _stretch_mid_to_exponent(black_level, mid_level, white_level):
+    span = max(1.0, float(white_level) - float(black_level))
+    mid_norm = (float(mid_level) - float(black_level)) / span
+    mid_norm = max(0.001, min(0.999, mid_norm))
+    return max(0.05, min(20.0, math.log(0.5) / math.log(mid_norm)))
+
+
 class ZWOFramePreview(QWidget):
     roi_selected = Signal(int, int, int, int)
 
@@ -227,8 +270,12 @@ class ZWOFramePreview(QWidget):
         self.setMinimumSize(520, 420)
         self._placeholder_text = "No frame captured."
         self._pixmap = None
+        self._raw_frame_array = None
         self._frame_width = 0
         self._frame_height = 0
+        self._display_black = 0.0
+        self._display_white = 255.0
+        self._display_mid = 127.5
         self._analysis_roi = None
         self._dragging = False
         self._drag_start = None
@@ -237,6 +284,7 @@ class ZWOFramePreview(QWidget):
     def set_placeholder_text(self, text):
         self._placeholder_text = text or ""
         self._pixmap = None
+        self._raw_frame_array = None
         self._frame_width = 0
         self._frame_height = 0
         self._analysis_roi = None
@@ -245,22 +293,62 @@ class ZWOFramePreview(QWidget):
         self._drag_end = None
         self.update()
 
+    def set_display_stretch(self, black_level, mid_level, white_level):
+        self._display_black = float(black_level)
+        self._display_mid = float(mid_level)
+        self._display_white = float(white_level)
+        self._refresh_pixmap()
+        self.update()
+
     def set_frame_array(self, frame_array):
         if frame_array is None:
             self.set_placeholder_text("No frame captured.")
             return
         try:
             height, width = frame_array.shape[:2]
-            image = QImage(frame_array.data, width, height, width, QImage.Format_Grayscale8).copy()
-            self._pixmap = QPixmap.fromImage(image)
+            self._raw_frame_array = frame_array
             self._frame_width = int(width)
             self._frame_height = int(height)
+            self._refresh_pixmap()
             self._placeholder_text = ""
             self._analysis_roi = self._clamp_roi(self._analysis_roi)
         except BaseException:
             self.set_placeholder_text("Frame captured, but preview rendering failed.")
             return
         self.update()
+
+    def _refresh_pixmap(self):
+        if self._raw_frame_array is None:
+            self._pixmap = None
+            return
+        try:
+            frame = self._raw_frame_array
+            if np is None:
+                height, width = frame.shape[:2]
+                image = QImage(frame.data, width, height, width, QImage.Format_Grayscale8).copy()
+                self._pixmap = QPixmap.fromImage(image)
+                return
+
+            arr = np.asarray(frame)
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            arr = np.ascontiguousarray(arr)
+            black = float(self._display_black)
+            mid = float(self._display_mid)
+            white = float(self._display_white)
+            if white <= black:
+                white = black + 1.0
+            scaled = (arr.astype(np.float32, copy=False) - black) / (white - black)
+            scaled = np.clip(scaled, 0.0, 1.0)
+            exponent = _stretch_mid_to_exponent(black, mid, white)
+            if abs(exponent - 1.0) > 0.001:
+                scaled = np.power(scaled, exponent)
+            display = np.ascontiguousarray(np.rint(scaled * 255.0).astype(np.uint8))
+            height, width = display.shape[:2]
+            image = QImage(display.data, width, height, width, QImage.Format_Grayscale8).copy()
+            self._pixmap = QPixmap.fromImage(image)
+        except BaseException:
+            self._pixmap = None
 
     def set_analysis_roi(self, roi):
         self._analysis_roi = self._clamp_roi(roi)
@@ -393,6 +481,191 @@ class ZWOFramePreview(QWidget):
         event.accept()
 
 
+class ZWODisplayHistogramWidget(QWidget):
+    stretch_changed = Signal(float, float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(130)
+        self.setMouseTracking(True)
+        self._histogram = None
+        self._range_max = 255.0
+        self._black = 0.0
+        self._mid = 127.5
+        self._white = 255.0
+        self._drag_marker = None
+
+    def set_frame_array(self, frame_array):
+        if frame_array is None or np is None:
+            self._histogram = None
+            self.update()
+            return
+        try:
+            arr = np.asarray(frame_array)
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            arr = arr[np.isfinite(arr)] if np.issubdtype(arr.dtype, np.floating) else arr.ravel()
+            if arr.size == 0:
+                self._histogram = None
+                self.update()
+                return
+            range_max = self._range_max_for_array(arr)
+            self.set_range_max(range_max, emit=False)
+            hist, _edges = np.histogram(arr, bins=256, range=(0.0, self._range_max))
+            self._histogram = hist.astype(np.float64, copy=False)
+        except BaseException:
+            self._histogram = None
+        self.update()
+
+    def set_range_max(self, range_max, emit=False):
+        self._range_max = max(1.0, float(range_max))
+        self._black, self._mid, self._white = self._clamped_levels(self._black, self._mid, self._white)
+        if emit:
+            self.stretch_changed.emit(self._black, self._mid, self._white)
+        self.update()
+
+    def set_levels(self, black, mid, white, emit=False):
+        self._black, self._mid, self._white = self._clamped_levels(black, mid, white)
+        if emit:
+            self.stretch_changed.emit(self._black, self._mid, self._white)
+        self.update()
+
+    def _range_max_for_array(self, arr):
+        try:
+            if np.issubdtype(arr.dtype, np.integer):
+                dtype_max = float(np.iinfo(arr.dtype).max)
+                return 255.0 if dtype_max <= 255.0 else 65535.0
+            data_max = float(np.nanmax(arr))
+            return 255.0 if data_max <= 255.0 else min(65535.0, max(255.0, data_max))
+        except BaseException:
+            return 255.0
+
+    def _clamped_levels(self, black, mid, white):
+        black = max(0.0, min(float(black), self._range_max - 1.0))
+        white = max(black + 1.0, min(float(white), self._range_max))
+        mid = max(black + 0.001, min(float(mid), white - 0.001))
+        return black, mid, white
+
+    def _hist_rect(self):
+        return self.rect().adjusted(12, 12, -12, -26)
+
+    def _level_to_x(self, level):
+        rect = self._hist_rect()
+        if rect.width() <= 0:
+            return float(rect.left())
+        return rect.left() + (float(level) / self._range_max) * rect.width()
+
+    def _x_to_level(self, x):
+        rect = self._hist_rect()
+        if rect.width() <= 0:
+            return 0.0
+        return max(0.0, min(self._range_max, ((float(x) - rect.left()) / rect.width()) * self._range_max))
+
+    def _nearest_marker(self, x):
+        distances = {
+            "black": abs(float(x) - self._level_to_x(self._black)),
+            "mid": abs(float(x) - self._level_to_x(self._mid)),
+            "white": abs(float(x) - self._level_to_x(self._white)),
+        }
+        marker, distance = min(distances.items(), key=lambda item: item[1])
+        return marker if distance <= 14.0 else None
+
+    def _move_marker(self, marker, x):
+        level = self._x_to_level(x)
+        black, mid, white = self._black, self._mid, self._white
+        if marker == "black":
+            old_span = max(1.0, white - black)
+            mid_fraction = (mid - black) / old_span
+            black = min(level, white - 1.0)
+            mid = black + (white - black) * mid_fraction
+        elif marker == "white":
+            old_span = max(1.0, white - black)
+            mid_fraction = (mid - black) / old_span
+            white = max(level, black + 1.0)
+            mid = black + (white - black) * mid_fraction
+        elif marker == "mid":
+            mid = level
+        self.set_levels(black, mid, white, emit=True)
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#101419"))
+        painter.setPen(QColor("#3a3f45"))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+        rect = self._hist_rect()
+        painter.fillRect(rect, QColor("#151b22"))
+        painter.setPen(QColor("#303844"))
+        painter.drawRect(rect)
+
+        if self._histogram is not None and self._histogram.size > 0:
+            max_count = float(np.max(self._histogram)) if np is not None else 0.0
+            if max_count <= 0.0:
+                max_count = 1.0
+            bin_width = rect.width() / float(self._histogram.size)
+            painter.setPen(QPen(QColor("#87919d"), max(1.0, bin_width)))
+            for idx, count in enumerate(self._histogram):
+                x = rect.left() + (idx + 0.5) * bin_width
+                norm = math.log1p(float(count)) / math.log1p(max_count)
+                y = rect.bottom() - norm * rect.height()
+                painter.drawLine(QPointF(x, rect.bottom()), QPointF(x, y))
+        else:
+            painter.setPen(QColor("#9aa3ad"))
+            painter.drawText(rect, Qt.AlignCenter, "No live histogram yet")
+
+        curve = QPolygonF()
+        exponent = _stretch_mid_to_exponent(self._black, self._mid, self._white)
+        for idx in range(96):
+            x_norm = idx / 95.0
+            y_norm = x_norm ** exponent
+            x = self._level_to_x(self._black + x_norm * (self._white - self._black))
+            y = rect.bottom() - y_norm * rect.height()
+            curve.append(QPointF(x, y))
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(QColor("#ffd60a"), 2))
+        painter.drawPolyline(curve)
+
+        for marker, level, label in [
+            ("black", self._black, "B"),
+            ("mid", self._mid, "M"),
+            ("white", self._white, "W"),
+        ]:
+            del marker
+            x = self._level_to_x(level)
+            painter.setPen(QPen(QColor("#ffd60a"), 1.5, Qt.DashLine))
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            painter.setPen(QColor("#ffd60a"))
+            painter.drawText(QRectF(x - 18, rect.bottom() + 4, 36, 18), Qt.AlignCenter, f"{label} {level:.0f}")
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        marker = self._nearest_marker(point.x())
+        if marker is None:
+            marker = "mid"
+        self._drag_marker = marker
+        self._move_marker(marker, point.x())
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        if self._drag_marker is not None:
+            self._move_marker(self._drag_marker, point.x())
+            event.accept()
+            return
+        self.setCursor(Qt.SizeHorCursor if self._nearest_marker(point.x()) is not None else Qt.ArrowCursor)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mouseReleaseEvent(event)
+        self._drag_marker = None
+        self.setCursor(Qt.ArrowCursor)
+        event.accept()
+
+
 class ZWOLineProfileWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -500,6 +773,9 @@ class MonochromatorWindow(QMainWindow):
         self._arrow_jog_dialog_closing = False
         self._cli_jog_dialog = None
         self._cli_jog_dialog_closing = False
+        self._auto_initialize_attempted = False
+        self._auto_camera_refresh_attempted = False
+        self._refresh_ports_attention = False
 
         self.setWindowTitle("Monochromator Control")
         self.resize(1200, 860)
@@ -526,6 +802,7 @@ class MonochromatorWindow(QMainWindow):
         self.quit_shortcut.activated.connect(self.close)
         self.close_shortcut = QShortcut(QKeySequence.StandardKey.Close, self)
         self.close_shortcut.activated.connect(self.close)
+        QTimer.singleShot(250, self._auto_initialize_controller_once)
 
     def _build_ui(self):
         central = QWidget()
@@ -598,45 +875,71 @@ class MonochromatorWindow(QMainWindow):
 
     def _build_connection_group(self):
         box = QGroupBox("Connection")
-        layout = QHBoxLayout(box)
+        layout = QVBoxLayout(box)
+        layout.setSpacing(6)
 
-        layout.addWidget(QLabel("Port"))
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+        controls.addWidget(QLabel("Port"))
 
         self.port_combo = QComboBox()
         self.port_combo.setEditable(True)
         self.port_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.port_combo.setMinimumContentsLength(28)
-        layout.addWidget(self.port_combo, 1)
+        self.port_combo.setMinimumWidth(300)
+        self.port_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        controls.addWidget(self.port_combo, 2)
 
         self.port_refresh_button = QPushButton("Refresh Ports")
-        self.port_refresh_button.clicked.connect(self._refresh_ports)
-        layout.addWidget(self.port_refresh_button)
+        self.port_refresh_button.clicked.connect(lambda _checked=False: self._refresh_ports(preserve_selection=True))
+        controls.addWidget(self.port_refresh_button)
 
         self.init_button = QPushButton("Initialize Controller")
-        self.init_button.clicked.connect(self._initialize_backend)
-        layout.addWidget(self.init_button)
+        self.init_button.setStyleSheet(
+            "QPushButton { background-color: #6d35d4; color: white; font-weight: 600; "
+            "border: 1px solid #5425ad; border-radius: 3px; padding: 1px 6px; min-height: 0px; } "
+            "QPushButton:hover { background-color: #7b43e4; } "
+            "QPushButton:disabled { background-color: #6f687b; color: #d2ccd8; border-color: #5c5665; }"
+        )
+        self.init_button.clicked.connect(lambda _checked=False: self._initialize_backend(auto_start=False))
+        controls.addWidget(self.init_button)
 
         self.refresh_button = QPushButton("Refresh Status")
         self.refresh_button.clicked.connect(self._refresh_status_manual)
-        layout.addWidget(self.refresh_button)
+        controls.addWidget(self.refresh_button)
 
         self.cancel_button = QPushButton("Cancel Operation")
         self.cancel_button.clicked.connect(self._cancel_current_operation)
-        layout.addWidget(self.cancel_button)
+        controls.addWidget(self.cancel_button)
 
         self.close_button = QPushButton("Close GUI")
+        self.close_button.setStyleSheet(
+            "QPushButton { background-color: #c92f2f; color: white; font-weight: 600; "
+            "border: 1px solid #9f2323; border-radius: 3px; padding: 1px 6px; min-height: 0px; } "
+            "QPushButton:hover { background-color: #dc3d3d; } "
+            "QPushButton:disabled { background-color: #7a5d5d; color: #d8cccc; border-color: #644c4c; }"
+        )
         self.close_button.clicked.connect(self.close)
-        layout.addWidget(self.close_button)
+        controls.addWidget(self.close_button)
 
         self.camera_pane_toggle_button = QPushButton("Hide Camera Pane")
         self.camera_pane_toggle_button.setCheckable(True)
         self.camera_pane_toggle_button.setChecked(True)
         self.camera_pane_toggle_button.clicked.connect(self._toggle_camera_pane)
-        layout.addWidget(self.camera_pane_toggle_button)
+        controls.addWidget(self.camera_pane_toggle_button)
 
-        self.connection_label = QLabel("Backend not initialized.")
+        layout.addLayout(controls)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        status_caption = QLabel("Last action")
+        status_caption.setMinimumWidth(72)
+        status_row.addWidget(status_caption)
+
+        self.connection_label = ElidedStatusLabel("Backend not initialized.")
         self.connection_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        layout.addWidget(self.connection_label, 1)
+        status_row.addWidget(self.connection_label, 1)
+        layout.addLayout(status_row)
         return box
 
     def _build_status_group(self):
@@ -908,6 +1211,12 @@ class MonochromatorWindow(QMainWindow):
         connection_layout.addWidget(self.zwo_camera_combo, 1, 2, 1, 3)
 
         self.zwo_connect_button = QPushButton("Connect Camera")
+        self.zwo_connect_button.setStyleSheet(
+            "QPushButton { background-color: #248a3d; color: white; font-weight: 600; "
+            "border: 1px solid #1b6a2f; border-radius: 3px; padding: 1px 6px; min-height: 0px; } "
+            "QPushButton:hover { background-color: #2fa34a; } "
+            "QPushButton:disabled { background-color: #607562; color: #d0ded1; border-color: #526654; }"
+        )
         self.zwo_connect_button.clicked.connect(self._connect_zwo_camera)
         connection_layout.addWidget(self.zwo_connect_button, 2, 0)
 
@@ -915,9 +1224,23 @@ class MonochromatorWindow(QMainWindow):
         self.zwo_disconnect_button.clicked.connect(self._disconnect_zwo_camera)
         connection_layout.addWidget(self.zwo_disconnect_button, 2, 1)
 
+        self.zwo_reset_pane_button = QPushButton("Kill/Reset")
+        self.zwo_reset_pane_button.setMaximumWidth(96)
+        self.zwo_reset_pane_button.setStyleSheet(
+            "QPushButton { background-color: #c92f2f; color: white; font-weight: 600; "
+            "border: 1px solid #9f2323; border-radius: 3px; padding: 1px 6px; min-height: 0px; } "
+            "QPushButton:hover { background-color: #dc3d3d; } "
+            "QPushButton:disabled { background-color: #7a5d5d; color: #d8cccc; border-color: #644c4c; }"
+        )
+        self.zwo_reset_pane_button.setToolTip(
+            "Emergency camera UI reset: stop live preview, clear cached frames/ROI/profile, and reset display controls."
+        )
+        self.zwo_reset_pane_button.clicked.connect(self._reset_zwo_camera_pane)
+        connection_layout.addWidget(self.zwo_reset_pane_button, 2, 2)
+
         self.zwo_camera_connection_label = QLabel("No ZWO camera connected.")
         self.zwo_camera_connection_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        connection_layout.addWidget(self.zwo_camera_connection_label, 2, 2, 1, 3)
+        connection_layout.addWidget(self.zwo_camera_connection_label, 2, 3, 1, 2)
 
         layout.addWidget(connection_box)
 
@@ -1009,6 +1332,79 @@ class MonochromatorWindow(QMainWindow):
         roi_layout.addWidget(roi_hint, 2, 0, 1, 5)
 
         layout.addWidget(roi_box)
+
+        stretch_box = QGroupBox("Display Histogram Stretch")
+        stretch_layout = QGridLayout(stretch_box)
+
+        self.zwo_display_histogram = ZWODisplayHistogramWidget()
+        self.zwo_display_histogram.stretch_changed.connect(self._set_zwo_display_from_histogram)
+        stretch_layout.addWidget(self.zwo_display_histogram, 0, 0, 1, 5)
+
+        self.zwo_display_black_spin = QSpinBox()
+        self.zwo_display_black_spin.setRange(0, 255)
+        self.zwo_display_black_spin.setKeyboardTracking(False)
+        self.zwo_display_black_spin.setValue(0)
+        self.zwo_display_black_spin.valueChanged.connect(self._sync_zwo_display_black_slider)
+        self.zwo_display_black_spin.valueChanged.connect(lambda _value: self._apply_zwo_display_stretch())
+        stretch_layout.addWidget(QLabel("Black"), 1, 0)
+        stretch_layout.addWidget(self.zwo_display_black_spin, 1, 1)
+
+        self.zwo_display_black_slider = QSlider(Qt.Horizontal)
+        self.zwo_display_black_slider.setRange(0, 255)
+        self.zwo_display_black_slider.setValue(0)
+        self.zwo_display_black_slider.valueChanged.connect(self.zwo_display_black_spin.setValue)
+        stretch_layout.addWidget(self.zwo_display_black_slider, 1, 2, 1, 3)
+
+        self.zwo_display_mid_spin = QSpinBox()
+        self.zwo_display_mid_spin.setRange(1, 254)
+        self.zwo_display_mid_spin.setKeyboardTracking(False)
+        self.zwo_display_mid_spin.setValue(128)
+        self.zwo_display_mid_spin.valueChanged.connect(self._sync_zwo_display_mid_slider)
+        self.zwo_display_mid_spin.valueChanged.connect(lambda _value: self._apply_zwo_display_stretch())
+        stretch_layout.addWidget(QLabel("Mid"), 2, 0)
+        stretch_layout.addWidget(self.zwo_display_mid_spin, 2, 1)
+
+        self.zwo_display_mid_slider = QSlider(Qt.Horizontal)
+        self.zwo_display_mid_slider.setRange(1, 254)
+        self.zwo_display_mid_slider.setValue(128)
+        self.zwo_display_mid_slider.valueChanged.connect(self.zwo_display_mid_spin.setValue)
+        stretch_layout.addWidget(self.zwo_display_mid_slider, 2, 2, 1, 3)
+
+        self.zwo_display_white_spin = QSpinBox()
+        self.zwo_display_white_spin.setRange(1, 255)
+        self.zwo_display_white_spin.setKeyboardTracking(False)
+        self.zwo_display_white_spin.setValue(255)
+        self.zwo_display_white_spin.valueChanged.connect(self._sync_zwo_display_white_slider)
+        self.zwo_display_white_spin.valueChanged.connect(lambda _value: self._apply_zwo_display_stretch())
+        stretch_layout.addWidget(QLabel("White"), 3, 0)
+        stretch_layout.addWidget(self.zwo_display_white_spin, 3, 1)
+
+        self.zwo_display_white_slider = QSlider(Qt.Horizontal)
+        self.zwo_display_white_slider.setRange(1, 255)
+        self.zwo_display_white_slider.setValue(255)
+        self.zwo_display_white_slider.valueChanged.connect(self.zwo_display_white_spin.setValue)
+        stretch_layout.addWidget(self.zwo_display_white_slider, 3, 2, 1, 3)
+
+        self.zwo_display_auto_button = QPushButton("Auto Stretch")
+        self.zwo_display_auto_button.clicked.connect(self._auto_zwo_display_stretch)
+        stretch_layout.addWidget(self.zwo_display_auto_button, 4, 0)
+
+        self.zwo_display_reset_button = QPushButton("Reset")
+        self.zwo_display_reset_button.clicked.connect(self._reset_zwo_display_stretch)
+        stretch_layout.addWidget(self.zwo_display_reset_button, 4, 1)
+
+        self.zwo_display_auto_live_check = QCheckBox("Auto live")
+        self.zwo_display_auto_live_check.setToolTip("Recompute black/white levels from every incoming live frame.")
+        self.zwo_display_auto_live_check.toggled.connect(
+            lambda checked: self._auto_zwo_display_stretch(update_preview=True) if checked else None
+        )
+        stretch_layout.addWidget(self.zwo_display_auto_live_check, 4, 2)
+
+        self.zwo_display_status_label = QLabel("Display stretch: black 0, mid 128, white 255")
+        self.zwo_display_status_label.setWordWrap(True)
+        stretch_layout.addWidget(self.zwo_display_status_label, 4, 3, 1, 2)
+
+        layout.addWidget(stretch_box)
 
         preview_box = QGroupBox("Live Preview / Analysis")
         preview_box_layout = QVBoxLayout(preview_box)
@@ -1529,6 +1925,10 @@ class MonochromatorWindow(QMainWindow):
     def _task_is_active(self):
         return bool(self._task_thread is not None and self._task_thread.isRunning())
 
+    def _is_operation_cancelled_error(self, error_text):
+        text = str(error_text).lower()
+        return "operation cancelled" in text or "_quittomain" in text
+
     def _is_jog_active(self):
         return bool(self.arrow_jog_checkbox.isChecked() or self._mouse_jog_active)
 
@@ -1853,7 +2253,6 @@ class MonochromatorWindow(QMainWindow):
             self.zwo_roi_h_spin,
             self.zwo_capture_frame_button,
             self.zwo_apply_roi_button,
-            self.zwo_reset_roi_button,
         ]:
             widget.setEnabled(bool(idle and not live_active))
 
@@ -1881,6 +2280,18 @@ class MonochromatorWindow(QMainWindow):
         self.zwo_camera_exposure_spin.setEnabled(zwo_settings_enabled)
         self.zwo_camera_gain_spin.setEnabled(zwo_settings_enabled)
         self.zwo_apply_settings_button.setEnabled(zwo_settings_enabled)
+        self.zwo_reset_pane_button.setEnabled(bool(not self._closing and not self._shutdown_complete))
+        zwo_display_enabled = bool(not self._closing and not self._shutdown_complete and np is not None)
+        self.zwo_display_histogram.setEnabled(zwo_display_enabled)
+        self.zwo_display_black_spin.setEnabled(zwo_display_enabled)
+        self.zwo_display_black_slider.setEnabled(zwo_display_enabled)
+        self.zwo_display_mid_spin.setEnabled(zwo_display_enabled)
+        self.zwo_display_mid_slider.setEnabled(zwo_display_enabled)
+        self.zwo_display_white_spin.setEnabled(zwo_display_enabled)
+        self.zwo_display_white_slider.setEnabled(zwo_display_enabled)
+        self.zwo_display_reset_button.setEnabled(zwo_display_enabled)
+        self.zwo_display_auto_live_check.setEnabled(zwo_display_enabled)
+        self.zwo_display_auto_button.setEnabled(bool(zwo_display_enabled and self._zwo_last_frame_array is not None))
         self.zwo_center_tolerance_spin.setEnabled(zwo_center_enabled)
         self.zwo_center_max_steps_spin.setEnabled(zwo_center_enabled)
         self.zwo_center_settle_ms_spin.setEnabled(zwo_center_enabled)
@@ -1898,6 +2309,15 @@ class MonochromatorWindow(QMainWindow):
         )
         self.zwo_clear_selected_roi_button.setEnabled(
             bool(self._zwo_last_frame_array is not None and not self._busy and not self._closing)
+        )
+        self.zwo_reset_roi_button.setEnabled(
+            bool(
+                ready
+                and zwo_camera_connected
+                and not self._busy
+                and not task_active
+                and not self._closing
+            )
         )
 
         self.zwo_start_live_button.setEnabled(bool(idle and not live_active))
@@ -1927,7 +2347,22 @@ class MonochromatorWindow(QMainWindow):
             return None
         return text
 
+    def _set_refresh_ports_attention(self, active):
+        self._refresh_ports_attention = bool(active)
+        if not hasattr(self, "port_refresh_button"):
+            return
+        if active:
+            self.port_refresh_button.setStyleSheet(
+                "QPushButton { background-color: #1d73d8; color: white; font-weight: 600; "
+                "border: 1px solid #1559a8; border-radius: 3px; padding: 1px 6px; min-height: 0px; } "
+                "QPushButton:hover { background-color: #2d84eb; } "
+                "QPushButton:disabled { background-color: #65788f; color: #d5dde8; border-color: #58687a; }"
+            )
+        else:
+            self.port_refresh_button.setStyleSheet("")
+
     def _refresh_ports(self, preserve_selection=True):
+        self._set_refresh_ports_attention(False)
         current_data = self.port_combo.currentData()
         current_text = self.port_combo.currentText().strip()
         restore_manual_text = False
@@ -1959,8 +2394,10 @@ class MonochromatorWindow(QMainWindow):
 
         if ports:
             self._log(f"[GUI] Found {len(ports)} serial port(s)")
+            self.connection_label.setText("Ports refreshed. Select a port, then click Initialize Controller.")
         else:
             self._log("[GUI] No serial ports found; you can still type a port manually")
+            self.connection_label.setText("No serial ports found. Check USB/power, then refresh ports again.")
 
     def _validate_nonzero_order(self, order_value, context):
         if int(order_value) == 0:
@@ -2075,6 +2512,184 @@ class MonochromatorWindow(QMainWindow):
             f"Gain {status.get('gain', '--')}"
         )
 
+    def _sync_zwo_display_black_slider(self, value):
+        if not hasattr(self, "zwo_display_black_slider"):
+            return
+        self.zwo_display_black_slider.blockSignals(True)
+        self.zwo_display_black_slider.setValue(int(value))
+        self.zwo_display_black_slider.blockSignals(False)
+
+    def _sync_zwo_display_mid_slider(self, value):
+        if not hasattr(self, "zwo_display_mid_slider"):
+            return
+        self.zwo_display_mid_slider.blockSignals(True)
+        self.zwo_display_mid_slider.setValue(int(value))
+        self.zwo_display_mid_slider.blockSignals(False)
+
+    def _sync_zwo_display_white_slider(self, value):
+        if not hasattr(self, "zwo_display_white_slider"):
+            return
+        self.zwo_display_white_slider.blockSignals(True)
+        self.zwo_display_white_slider.setValue(int(value))
+        self.zwo_display_white_slider.blockSignals(False)
+
+    def _zwo_display_range_max(self):
+        if not hasattr(self, "zwo_display_white_spin"):
+            return 255
+        return int(self.zwo_display_white_spin.maximum())
+
+    def _set_zwo_display_range_max(self, range_max):
+        range_max = max(1, min(65535, int(round(float(range_max)))))
+        old_range = self._zwo_display_range_max()
+        if range_max == old_range:
+            return
+        black, mid, white = self._zwo_display_values()
+        old_range = max(1, old_range)
+        black_fraction = black / old_range
+        mid_fraction = mid / old_range
+        white_fraction = white / old_range
+        black = max(0, min(int(round(black_fraction * range_max)), range_max - 1))
+        white = max(black + 1, min(int(round(white_fraction * range_max)), range_max))
+        mid = max(black, min(int(round(mid_fraction * range_max)), white))
+
+        widgets = [
+            self.zwo_display_black_spin,
+            self.zwo_display_black_slider,
+            self.zwo_display_mid_spin,
+            self.zwo_display_mid_slider,
+            self.zwo_display_white_spin,
+            self.zwo_display_white_slider,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.zwo_display_black_spin.setRange(0, max(0, range_max - 1))
+        self.zwo_display_black_slider.setRange(0, max(0, range_max - 1))
+        self.zwo_display_mid_spin.setRange(0, range_max)
+        self.zwo_display_mid_slider.setRange(0, range_max)
+        self.zwo_display_white_spin.setRange(1, range_max)
+        self.zwo_display_white_slider.setRange(1, range_max)
+        self.zwo_display_black_spin.setValue(black)
+        self.zwo_display_black_slider.setValue(black)
+        self.zwo_display_mid_spin.setValue(mid)
+        self.zwo_display_mid_slider.setValue(mid)
+        self.zwo_display_white_spin.setValue(white)
+        self.zwo_display_white_slider.setValue(white)
+        for widget in widgets:
+            widget.blockSignals(False)
+        self.zwo_display_histogram.set_range_max(range_max, emit=False)
+
+    def _zwo_display_values(self):
+        black = int(self.zwo_display_black_spin.value())
+        mid = int(self.zwo_display_mid_spin.value())
+        white = int(self.zwo_display_white_spin.value())
+        range_max = self._zwo_display_range_max()
+        if white <= black:
+            if black >= range_max:
+                black = max(0, range_max - 1)
+            white = min(range_max, black + 1)
+        mid = max(black, min(mid, white))
+        return black, mid, white
+
+    def _set_zwo_display_values(self, black, mid, white, *, apply=True):
+        range_max = self._zwo_display_range_max()
+        black = max(0, min(range_max - 1, int(round(float(black)))))
+        white = max(1, min(range_max, int(round(float(white)))))
+        if white <= black:
+            white = min(range_max, black + 1)
+        mid = max(black, min(int(round(float(mid))), white))
+
+        widgets = [
+            self.zwo_display_black_spin,
+            self.zwo_display_black_slider,
+            self.zwo_display_mid_spin,
+            self.zwo_display_mid_slider,
+            self.zwo_display_white_spin,
+            self.zwo_display_white_slider,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.zwo_display_black_spin.setValue(black)
+        self.zwo_display_black_slider.setValue(black)
+        self.zwo_display_mid_spin.setValue(mid)
+        self.zwo_display_mid_slider.setValue(mid)
+        self.zwo_display_white_spin.setValue(white)
+        self.zwo_display_white_slider.setValue(white)
+        for widget in widgets:
+            widget.blockSignals(False)
+
+        if apply:
+            self._apply_zwo_display_stretch()
+        else:
+            self.zwo_display_histogram.set_levels(black, mid, white, emit=False)
+            self._update_zwo_display_status_label()
+
+    def _set_zwo_display_from_histogram(self, black, mid, white):
+        self._set_zwo_display_values(black, mid, white, apply=True)
+
+    def _update_zwo_display_status_label(self):
+        if not hasattr(self, "zwo_display_status_label"):
+            return
+        black, mid, white = self._zwo_display_values()
+        frame_text = ""
+        if self._zwo_last_frame_array is not None and np is not None:
+            try:
+                arr = np.asarray(self._zwo_last_frame_array)
+                frame_text = f" | frame min {float(np.nanmin(arr)):.0f}, max {float(np.nanmax(arr)):.0f}"
+            except BaseException:
+                frame_text = ""
+        self.zwo_display_status_label.setText(
+            f"Display stretch: black {black}, mid {mid}, white {white}{frame_text}"
+        )
+
+    def _apply_zwo_display_stretch(self):
+        if not hasattr(self, "zwo_preview_label"):
+            return
+        black, mid, white = self._zwo_display_values()
+        if (
+            black != self.zwo_display_black_spin.value()
+            or mid != self.zwo_display_mid_spin.value()
+            or white != self.zwo_display_white_spin.value()
+        ):
+            self._set_zwo_display_values(black, mid, white, apply=False)
+        self.zwo_preview_label.set_display_stretch(black, mid, white)
+        self.zwo_display_histogram.set_levels(black, mid, white, emit=False)
+        self._update_zwo_display_status_label()
+
+    def _auto_zwo_display_stretch(self, *args, update_preview=True):
+        del args
+        if self._zwo_last_frame_array is None or np is None:
+            return
+        try:
+            arr = np.asarray(self._zwo_last_frame_array)
+            if arr.ndim == 3:
+                arr = arr[..., 0]
+            arr_f = arr.astype(np.float32, copy=False)
+            black = float(np.nanpercentile(arr_f, 1.0))
+            white = float(np.nanpercentile(arr_f, 99.5))
+            if not np.isfinite(black) or not np.isfinite(white):
+                return
+            if white <= black:
+                black = float(np.nanmin(arr_f))
+                white = float(np.nanmax(arr_f))
+            if white <= black:
+                white = black + 1.0
+            mid = black + (white - black) * 0.35
+            self._set_zwo_display_values(black, mid, white, apply=update_preview)
+        except BaseException as exc:
+            self.statusBar().showMessage(f"Auto stretch failed: {exc}", 5000)
+
+    def _reset_zwo_display_stretch(self):
+        if hasattr(self, "zwo_display_auto_live_check"):
+            self.zwo_display_auto_live_check.setChecked(False)
+        range_max = self._zwo_display_range_max()
+        self._set_zwo_display_values(0, range_max / 2.0, range_max, apply=True)
+
+    def _clear_zwo_histogram_data(self):
+        if hasattr(self, "zwo_display_histogram"):
+            self.zwo_display_histogram.set_frame_array(None)
+            black, mid, white = self._zwo_display_values()
+            self.zwo_display_histogram.set_levels(black, mid, white, emit=False)
+
     def _set_zwo_preview_text(self, text):
         self._zwo_last_frame_array = None
         self._zwo_analysis_local_roi = None
@@ -2088,6 +2703,7 @@ class MonochromatorWindow(QMainWindow):
         self.zwo_profile_integrated_label.setText("Integrated intensity: --")
         self.zwo_profile_mean_label.setText("Mean DN: --")
         self.zwo_profile_axis_label.setText("Axis: Horizontal")
+        self._update_zwo_display_status_label()
 
     def _set_zwo_preview_from_array(self, frame_array):
         if frame_array is None:
@@ -2095,8 +2711,16 @@ class MonochromatorWindow(QMainWindow):
             return
         try:
             self._zwo_last_frame_array = frame_array
+            if hasattr(self, "zwo_display_histogram"):
+                self.zwo_display_histogram.set_frame_array(frame_array)
+                self._set_zwo_display_range_max(self.zwo_display_histogram._range_max)
+            if self.zwo_display_auto_live_check.isChecked():
+                self._auto_zwo_display_stretch(update_preview=False)
+            black, mid, white = self._zwo_display_values()
+            self.zwo_preview_label.set_display_stretch(black, mid, white)
             self.zwo_preview_label.set_frame_array(frame_array)
             self._refresh_zwo_analysis_view()
+            self._update_zwo_display_status_label()
         except BaseException:
             self._set_zwo_preview_text("Frame captured, but preview rendering failed.")
 
@@ -2119,8 +2743,13 @@ class MonochromatorWindow(QMainWindow):
         if not isinstance(status, dict):
             return
         self._zwo_last_camera_status = dict(status)
+        camera_name = status.get("camera_name") or "Unknown camera"
+        camera_index = status.get("camera_index")
+        connected_text = f"Connected: {camera_name}"
+        if camera_index is not None:
+            connected_text += f" (index {camera_index})"
         self.zwo_camera_connection_label.setText(
-            f"Connected: {status.get('camera_name')}" if status.get("connected") else "No ZWO camera connected."
+            connected_text if status.get("connected") else "No ZWO camera connected."
         )
         self.zwo_camera_status_summary.setText(self._format_zwo_camera_status(status))
         if (
@@ -2336,7 +2965,7 @@ class MonochromatorWindow(QMainWindow):
         self.zwo_profile_peak_value_label.setText(f"Peak value: {peak_value:.1f}")
         self.zwo_profile_integrated_label.setText(f"Integrated intensity: {total_intensity:.1f}")
         mean_dn = analysis.get("mean_dn")
-        signal_ok = analysis.get("signal_present", False)
+        signal_ok = self._zwo_analysis_can_center()
         self.zwo_profile_mean_label.setText(f"Mean DN: {float(mean_dn):.3f}" if mean_dn is not None else "Mean DN: --")
         axis_extra = "signal OK" if signal_ok else "no clear signal"
         self.zwo_profile_axis_label.setText(f"Axis: {axis_label} | {axis_extra}")
@@ -2346,17 +2975,47 @@ class MonochromatorWindow(QMainWindow):
 
     def _zwo_analysis_can_center(self):
         analysis = self._zwo_last_analysis if isinstance(self._zwo_last_analysis, dict) else None
-        return bool(analysis and analysis.get("signal_present"))
+        if not analysis:
+            return False
+        if "signal_present" in analysis:
+            return bool(analysis.get("signal_present"))
+        profile = analysis.get("profile")
+        if not profile:
+            return False
+        try:
+            values = [float(v) for v in profile]
+            peak_value = float(analysis.get("peak_value", max(values)))
+            integrated = float(analysis.get("integrated_intensity", sum(values)))
+            if integrated <= 0.0 or peak_value <= 0.0:
+                return False
+            if len(values) < 3:
+                return peak_value > 0.0
+            if np is not None:
+                arr = np.asarray(values, dtype=np.float64)
+                median = float(np.median(arr))
+                noise = float(np.median(np.abs(arr - median)))
+                spread = float(np.std(arr))
+                threshold = median + max(5.0, 6.0 * noise, 2.5 * spread)
+                return bool(peak_value > threshold or (median > 0.0 and peak_value > median * 1.10))
+            mean_value = sum(values) / float(len(values))
+            return bool(mean_value > 0.0 and peak_value > mean_value * 1.10)
+        except BaseException:
+            return False
 
     def _clear_selected_preview_roi(self):
         self._zwo_analysis_local_roi = None
         self._refresh_zwo_analysis_view()
         self._refresh_control_states()
-        if self._zwo_last_frame_array is not None:
+        if self.backend is not None and self._zwo_last_camera_status.get("connected") and not self._busy and not self._closing:
+            self.zwo_camera_info_output.setPlainText(
+                "Clearing selection and resetting camera ROI to full frame.\n"
+                "Live preview will restart automatically if it is running."
+            )
+            self._reset_zwo_camera_roi()
+        elif self._zwo_last_frame_array is not None:
             self.zwo_camera_info_output.setPlainText(
                 "Preview ROI selection cleared.\n"
-                "Analysis is back to the full visible frame.\n"
-                "Camera ROI is unchanged until you apply a new one."
+                "Analysis is back to the full visible frame."
             )
 
     def _apply_selected_preview_roi_to_camera(self):
@@ -2481,14 +3140,14 @@ class MonochromatorWindow(QMainWindow):
                 self._log("[GUI] ZWO camera status refresh failed")
                 self._log(error_text)
 
-    def _refresh_zwo_cameras(self):
+    def _refresh_zwo_cameras(self, auto_start=False):
         if self.backend is None or self._busy or self._closing:
             return
         self._run_task(
-            "Refresh ZWO cameras",
+            "Auto-refresh ZWO cameras" if auto_start else "Refresh ZWO cameras",
             self.backend.list_zwo_cameras,
             self._current_zwo_sdk_path(),
-            task_kind="zwo_camera_refresh",
+            task_kind="zwo_camera_refresh_auto" if auto_start else "zwo_camera_refresh",
         )
 
     def _connect_zwo_camera(self):
@@ -2498,7 +3157,12 @@ class MonochromatorWindow(QMainWindow):
             return
         camera_index = self.zwo_camera_combo.currentData()
         if camera_index is None:
-            QMessageBox.warning(self, "No Camera Selected", "Refresh cameras first, then select a ZWO camera.")
+            QMessageBox.warning(
+                self,
+                "No Camera Detected",
+                "No ZWO camera is selected or detected.\n\n"
+                "Click Refresh Cameras, make sure the camera is plugged in and powered, then try Connect Camera again.",
+            )
             return
         self._run_task(
             "Connect ZWO camera",
@@ -2587,6 +3251,11 @@ class MonochromatorWindow(QMainWindow):
             return
         was_live_running = bool(self._zwo_live_thread is not None)
         self._zwo_resume_live_after_roi_change = was_live_running
+        if was_live_running:
+            self.zwo_camera_info_output.setPlainText(
+                "Changing camera ROI.\n"
+                "Live preview is stopping temporarily and will restart automatically."
+            )
         if was_live_running and not self._ensure_zwo_live_preview_stopped(context="changing the ZWO ROI"):
             self._zwo_resume_live_after_roi_change = False
             return
@@ -2608,6 +3277,11 @@ class MonochromatorWindow(QMainWindow):
         self._refresh_zwo_analysis_view()
         was_live_running = bool(self._zwo_live_thread is not None)
         self._zwo_resume_live_after_roi_change = was_live_running
+        if was_live_running:
+            self.zwo_camera_info_output.setPlainText(
+                "Resetting camera ROI to full frame.\n"
+                "Live preview is stopping temporarily and will restart automatically."
+            )
         if was_live_running and not self._ensure_zwo_live_preview_stopped(context="resetting the ZWO ROI"):
             self._zwo_resume_live_after_roi_change = False
             return
@@ -2685,6 +3359,51 @@ class MonochromatorWindow(QMainWindow):
             )
             self.zwo_camera_info_output.setPlainText(message)
             QMessageBox.warning(self, "ZWO live preview", message)
+
+    def _reset_zwo_camera_pane(self):
+        if self._closing:
+            return
+        self._log("[GUI] Camera pane reset requested")
+        self._zwo_pending_camera_settings = None
+        self._zwo_resume_live_after_center = False
+        self._zwo_resume_live_after_roi_change = False
+        self._zwo_live_error_seen = False
+        self._zwo_live_last_frame_ts = None
+        self._zwo_live_actual_fps = None
+        self._zwo_live_info_last_update_ts = None
+
+        if self._zwo_live_thread is not None:
+            self._zwo_live_stop_requested = True
+            self._stop_zwo_live_preview(wait=False)
+
+        if self.backend is not None and self._active_task_kind in {
+            "zwo_camera_capture",
+            "zwo_camera_settings",
+            "zwo_camera_roi",
+            "zwo_center_feature",
+            "zwo_calibration",
+        }:
+            try:
+                self.backend.cancel()
+            except BaseException:
+                self._log("[GUI] Camera pane reset could not cancel active ZWO task")
+
+        self.zwo_live_fps_spin.setValue(30.0)
+        self.zwo_camera_exposure_spin.setValue(50.0)
+        self.zwo_camera_gain_spin.setValue(100)
+        self.zwo_display_auto_live_check.setChecked(False)
+        if hasattr(self, "zwo_display_histogram"):
+            self.zwo_display_histogram.set_frame_array(None)
+        self._reset_zwo_display_stretch()
+        self._set_zwo_preview_text("Camera pane reset. Live preview stop requested.")
+        self.zwo_camera_info_output.setPlainText(
+            "Camera pane reset.\n"
+            "- Live preview stop requested if it was running\n"
+            "- Cached frame, analysis ROI, profile, and histogram cleared\n"
+            "- Display stretch, exposure field, gain field, and target FPS reset\n\n"
+            "If the SDK was stuck inside a frame capture, wait a few seconds before starting live again."
+        )
+        self._refresh_control_states()
 
     def _ensure_zwo_live_preview_stopped(self, *, context, timeout_ms=5000):
         if self._zwo_live_thread is None:
@@ -2774,8 +3493,10 @@ class MonochromatorWindow(QMainWindow):
             self._zwo_live_error_seen = False
             self._zwo_live_last_frame_ts = None
             self._zwo_live_actual_fps = None
+            self._clear_zwo_histogram_data()
             return
         if self._zwo_live_stop_requested:
+            self._clear_zwo_histogram_data()
             self.zwo_camera_info_output.setPlainText("Live preview stopped.")
             self._log("[GUI] ZWO live preview stopped")
         self._zwo_live_stop_requested = False
@@ -2815,13 +3536,21 @@ class MonochromatorWindow(QMainWindow):
 
         self._exit_arrow_jog_mode(cancel_active=False)
 
-    def _initialize_backend(self):
+    def _auto_initialize_controller_once(self):
+        if self._auto_initialize_attempted or self.backend is not None or self._closing:
+            return
+        self._auto_initialize_attempted = True
+        self._initialize_backend(auto_start=True)
+
+    def _initialize_backend(self, auto_start=False):
         if self._busy:
             return
+        self._set_refresh_ports_attention(False)
         selected_port = self._selected_port()
         init_target = selected_port or "auto-detect"
-        self._set_busy(True, f"Initializing backend on {init_target}...")
-        self._log(f"[GUI] Initializing controller backend on {init_target}")
+        action = "Auto-initializing" if auto_start else "Initializing"
+        self._set_busy(True, f"{action} backend on {init_target}...")
+        self._log(f"[GUI] {action} controller backend on {init_target}")
         try:
             if self.backend is not None and selected_port:
                 current_status = self.backend.status()
@@ -2840,14 +3569,24 @@ class MonochromatorWindow(QMainWindow):
             self._refresh_calibration_views(silent=True)
             self._refresh_zwo_camera_status_view(silent=True)
             self._log("[GUI] Backend initialized")
+            if not self._auto_camera_refresh_attempted:
+                self._auto_camera_refresh_attempted = True
+                QTimer.singleShot(0, lambda: self._refresh_zwo_cameras(auto_start=True))
         except BaseException:
             error_text = traceback.format_exc()
             self.backend = None
-            self._set_busy(False, "Initialization failed.")
+            if auto_start:
+                self._set_busy(False, "Auto-initialize failed. Click Refresh Ports, then Initialize Controller.")
+                self._set_refresh_ports_attention(True)
+            else:
+                self._set_busy(False, "Initialization failed.")
             self._set_backend_ready(False)
-            self._log("[GUI] Backend initialization failed")
+            self._log("[GUI] Backend auto-initialization failed" if auto_start else "[GUI] Backend initialization failed")
             self._log(error_text)
-            QMessageBox.critical(self, "Backend initialization failed", error_text)
+            if auto_start:
+                self.statusBar().showMessage("Auto-initialize failed. Refresh ports, select the Arduino, then initialize.", 9000)
+            else:
+                QMessageBox.critical(self, "Backend initialization failed", error_text)
 
     def _run_task(self, label, fn, *args, task_kind="default", log_message=True, **kwargs):
         if self.backend is None:
@@ -2904,11 +3643,12 @@ class MonochromatorWindow(QMainWindow):
             self._refresh_calibration_views(silent=True)
         if task_kind == "zwo_calibration":
             self.zwo_info_output.setPlainText(self._format_zwo_result(result.get("_result")))
-        elif task_kind == "zwo_camera_refresh":
+        elif task_kind in {"zwo_camera_refresh", "zwo_camera_refresh_auto"}:
             payload = result.get("_result", result)
             cameras = payload.get("cameras", [])
             self._update_zwo_camera_combo(cameras)
             self.zwo_camera_info_output.setPlainText(
+                f"{'Auto-refresh complete.' if task_kind == 'zwo_camera_refresh_auto' else 'Refresh complete.'}\n"
                 f"Detected {payload.get('camera_count', 0)} camera(s).\n"
                 f"SDK path: {payload.get('sdk_path') or '$ZWO_ASI_LIB'}"
             )
@@ -2919,11 +3659,12 @@ class MonochromatorWindow(QMainWindow):
                 self._zwo_pending_camera_settings = None
             self._apply_zwo_status_to_view(payload)
             if task_kind == "zwo_camera_disconnect":
+                self._clear_zwo_histogram_data()
                 self._set_zwo_preview_text("No frame captured.")
                 self.zwo_camera_info_output.setPlainText("ZWO camera disconnected.")
             elif task_kind == "zwo_camera_connect":
                 self._zwo_analysis_local_roi = None
-                self.zwo_camera_info_output.setPlainText("ZWO camera connected. Capture a single frame to verify the signal.")
+                self.zwo_camera_info_output.setPlainText("ZWO camera connected. Starting live preview...")
             elif task_kind == "zwo_camera_roi":
                 self._zwo_analysis_local_roi = None
                 self._refresh_zwo_analysis_view()
@@ -2978,15 +3719,23 @@ class MonochromatorWindow(QMainWindow):
 
     def _task_failed(self, error_text):
         task_kind = self._active_task_kind
-        fail_message = (
-            "Operation failed."
-            if task_kind == "cli_jog"
-            else (self._arrow_jog_status_text() if self._is_jog_active() else "Operation failed.")
-        )
+        was_cancelled = self._is_operation_cancelled_error(error_text)
+        if task_kind == "cli_jog":
+            fail_message = "Operation cancelled." if was_cancelled else "Operation failed."
+        elif self._is_jog_active():
+            fail_message = self._arrow_jog_status_text()
+        else:
+            fail_message = "Operation cancelled." if was_cancelled else "Operation failed."
         self._set_busy(False, "Closing controller..." if self._closing else fail_message)
         if task_kind == "cli_jog":
             self._set_cli_jog_active(False)
             self._hide_cli_jog_dialog()
+            if was_cancelled:
+                self._log("[GUI] CLI jog cancelled")
+                if not self._closing:
+                    self.connection_label.setText("CLI jog cancelled.")
+                    QTimer.singleShot(0, self._restore_post_jog_ui)
+                return
             self._log("[GUI] CLI jog failed")
             self._log(error_text)
             if self._closing:
@@ -2999,7 +3748,7 @@ class MonochromatorWindow(QMainWindow):
             self._jog_hold_direction = 0
             if self._closing:
                 return
-            if "Operation cancelled" in error_text:
+            if was_cancelled:
                 self._log("[GUI] Hold jog cancelled")
                 QTimer.singleShot(0, self._restore_post_jog_ui)
                 return
@@ -3014,7 +3763,7 @@ class MonochromatorWindow(QMainWindow):
             self._pending_jog_speed_ms = None
             if self._closing:
                 return
-            if "Operation cancelled" in error_text:
+            if was_cancelled:
                 self._log("[GUI] Jog cancelled")
                 if not self.arrow_jog_checkbox.isChecked():
                     QTimer.singleShot(0, self._restore_post_jog_ui)
@@ -3029,6 +3778,23 @@ class MonochromatorWindow(QMainWindow):
             return
         if task_kind == "zwo_camera_settings":
             self._zwo_pending_camera_settings = None
+        if was_cancelled:
+            if task_kind and task_kind.startswith("zwo_camera"):
+                self.zwo_camera_info_output.setPlainText("Operation cancelled.")
+            elif task_kind == "zwo_center_feature":
+                self.zwo_camera_info_output.setPlainText("Centering assist cancelled.")
+            self._log("[GUI] Operation cancelled")
+            if not self._closing:
+                self.connection_label.setText("Operation cancelled.")
+            return
+        if task_kind == "zwo_camera_refresh_auto":
+            self.zwo_camera_info_output.setPlainText(
+                "Automatic camera refresh failed.\n\n"
+                "Click Refresh Cameras after checking that the camera is plugged in and the SDK path is correct."
+            )
+            self._log("[GUI] Automatic ZWO camera refresh failed")
+            self._log(error_text)
+            return
         if task_kind and task_kind.startswith("zwo_camera"):
             self.zwo_camera_info_output.setPlainText(error_text)
         elif task_kind == "zwo_center_feature":
@@ -3079,6 +3845,13 @@ class MonochromatorWindow(QMainWindow):
             QTimer.singleShot(0, self._start_zwo_live_preview)
         elif finished_task_kind == "zwo_camera_roi":
             self._zwo_resume_live_after_roi_change = False
+        if (
+            finished_task_kind == "zwo_camera_connect"
+            and not self._closing
+            and self.backend is not None
+            and self._zwo_live_thread is None
+        ):
+            QTimer.singleShot(0, self._start_zwo_live_preview)
         if self._closing and not self._shutdown_complete and self._task_thread is None:
             self._finish_shutdown_after_task()
 
@@ -3096,10 +3869,10 @@ class MonochromatorWindow(QMainWindow):
             self._log(error_text)
 
     def _refresh_status_if_idle(self):
-        if self.backend is None or self._closing or self._is_jog_active():
+        if self.backend is None or self._closing:
             return
 
-        if self._busy or self._task_is_active():
+        if self._busy or self._task_is_active() or self._is_jog_active():
             try:
                 self._update_status(self.backend.live_status())
             except BaseException:
@@ -3222,6 +3995,7 @@ class MonochromatorWindow(QMainWindow):
             self._request_stop_zwo_live_preview()
             return
         self.backend.cancel()
+        self.connection_label.setText("Cancelling operation...")
         if self._active_task_kind == "zwo_center_feature":
             self.zwo_camera_info_output.setPlainText("Cancelling centering assist...")
         self._log("[GUI] Cancel requested")

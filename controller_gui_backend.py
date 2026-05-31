@@ -2020,6 +2020,17 @@ def _zwo_camera_property_dict(asi, camera_index):
         pass
     return {}
 
+def _zwo_camera_listed_name(asi, camera_index):
+    try:
+        listed_names = list(asi.list_cameras())
+        if 0 <= int(camera_index) < len(listed_names):
+            name = listed_names[int(camera_index)]
+            if name:
+                return str(name)
+    except Exception:
+        pass
+    return None
+
 def _zwo_list_cameras(lib_path=None):
     asi = _load_zwoasi(lib_path=lib_path)
     num_cameras = int(asi.get_num_cameras())
@@ -2031,9 +2042,7 @@ def _zwo_list_cameras(lib_path=None):
     cameras = []
     for camera_index in range(num_cameras):
         prop = _zwo_camera_property_dict(asi, camera_index)
-        name = None
-        if camera_index < len(listed_names):
-            name = listed_names[camera_index]
+        name = str(listed_names[camera_index]) if camera_index < len(listed_names) and listed_names[camera_index] else None
         if not name:
             name = prop.get("Name") or prop.get("name") or f"Camera {camera_index}"
         max_width = prop.get("MaxWidth")
@@ -2202,6 +2211,15 @@ def _zwo_profile_analysis(arr, *, axis="x", roi=None, feature="centroid"):
     peak_index = int(np.argmax(profile))
     peak_value = float(profile[peak_index])
     integrated_intensity = float(profile.sum())
+    profile_median = float(np.median(profile))
+    profile_mad = float(np.median(np.abs(profile - profile_median)))
+    profile_std = float(np.std(profile))
+    signal_threshold = profile_median + max(5.0, 6.0 * profile_mad, 2.5 * profile_std)
+    signal_present = bool(
+        integrated_intensity > 0.0
+        and peak_value > 0.0
+        and (peak_value > signal_threshold or (profile_median > 0.0 and peak_value > profile_median * 1.10))
+    )
     centroid_index = None
     if integrated_intensity > 0.0:
         coords = np.arange(profile.size, dtype=np.float64)
@@ -2230,6 +2248,8 @@ def _zwo_profile_analysis(arr, *, axis="x", roi=None, feature="centroid"):
         "error_px": None if feature_position is None else float(target_index - feature_position),
         "integrated_intensity": float(integrated_intensity),
         "mean_dn": float(region_f.mean()),
+        "signal_present": bool(signal_present),
+        "signal_threshold": float(signal_threshold),
         "region_width": int(roi_w),
         "region_height": int(roi_h),
     }
@@ -3341,14 +3361,14 @@ def _move_scan_to_first_target(target_steps: int, *, mode: str, force_home: bool
 
     raise ValueError("mode must be 'from_home_ccw' or 'shortest'")
 
-def _scan_step_to_target(target_steps: int):
+def _scan_step_to_target(target_steps: int, *, scan_step_delay_s=None):
     """
     Move directly from the current point to the next scan point without re-homing.
     This preserves a true stepped scan between endpoints.
     """
     delta_steps = int(round(target_steps)) - int(round(step_count))
     if delta_steps != 0:
-        _stage_move_signed(delta_steps)
+        _stage_move_signed(delta_steps, move_step_delay=scan_step_delay_s)
 
 def scan_wavelength(
     lam1: float,
@@ -3359,6 +3379,7 @@ def scan_wavelength(
     mode: str = "shortest",
     repeats: int = 1,
     dwell_s: float = 0.0,
+    scan_step_delay_ms: float | None = None,
     margin_nm: float = 0.0,
     rehome_each_repeat: bool = False,
     pingpong: bool = False,
@@ -3382,6 +3403,9 @@ def scan_wavelength(
         raise ValueError("step_nm must be > 0")
     if dwell_s < 0:
         raise ValueError("dwell_s must be >= 0")
+    scan_step_delay_s = None
+    if scan_step_delay_ms is not None:
+        scan_step_delay_s = _clamp_step_delay_ms(float(scan_step_delay_ms)) / 1000.0
     if margin_nm < 0:
         raise ValueError("margin_nm must be >= 0")
 
@@ -3405,12 +3429,12 @@ def scan_wavelength(
         if r == 0 or force_home:
             _move_scan_to_first_target(target_steps[0], mode=mode, force_home=force_home)
         else:
-            _scan_step_to_target(target_steps[0])
+            _scan_step_to_target(target_steps[0], scan_step_delay_s=scan_step_delay_s)
 
         for i, lam in enumerate(points):
             _check_cancel()
             if i != 0:
-                _scan_step_to_target(target_steps[i])
+                _scan_step_to_target(target_steps[i], scan_step_delay_s=scan_step_delay_s)
 
             # Optional dwell for acquisition
             _sleep_with_cancel(dwell_s)
@@ -3423,6 +3447,7 @@ def scan_angle(
     mode: str = "shortest",
     repeats: int = 1,
     dwell_s: float = 0.0,
+    scan_step_delay_ms: float | None = None,
     margin_deg: float = 0.0,
     rehome_each_repeat: bool = False,
     pingpong: bool = False,
@@ -3437,6 +3462,9 @@ def scan_angle(
         raise ValueError("step_deg must be > 0")
     if dwell_s < 0:
         raise ValueError("dwell_s must be >= 0")
+    scan_step_delay_s = None
+    if scan_step_delay_ms is not None:
+        scan_step_delay_s = _clamp_step_delay_ms(float(scan_step_delay_ms)) / 1000.0
     if margin_deg < 0:
         raise ValueError("margin_deg must be >= 0")
 
@@ -3457,13 +3485,16 @@ def scan_angle(
         if r == 0 or force_home:
             _move_scan_to_first_target(target_steps[0], mode=mode, force_home=force_home)
         else:
-            _scan_step_to_target(target_steps[0])
+            _scan_step_to_target(target_steps[0], scan_step_delay_s=scan_step_delay_s)
 
         for i, th in enumerate(points):
             _check_cancel()
             if i != 0:
-                _scan_step_to_target(target_steps[i])
+                _scan_step_to_target(target_steps[i], scan_step_delay_s=scan_step_delay_s)
             _sleep_with_cancel(dwell_s)
+
+_scan_wavelength_impl = scan_wavelength
+_scan_angle_impl = scan_angle
 
 def scan_menu():
     """
@@ -3677,7 +3708,7 @@ def position_menu():
             print("Invalid option.")
 
 
-def _stage_move_signed(delta_steps):
+def _stage_move_signed(delta_steps, move_step_delay=None):
     """
     Signed move with a fast pre-roll when far, then slower finishing.
     +delta => CW, -delta => CCW.
@@ -3688,6 +3719,10 @@ def _stage_move_signed(delta_steps):
     remaining = abs(delta_steps)
 
     print(f"[Stage] Moving {remaining} steps, dir={'CW' if direction>0 else 'CCW'}")
+
+    if move_step_delay is not None:
+        move_biased(remaining, float(move_step_delay), direction)
+        return
 
     # fast chunk
     if remaining > FAR_STEP_THRESHOLD_MOVE:
@@ -4062,6 +4097,25 @@ class MonochromatorGUIBackend:
             initialize_runtime(show_banner=False)
             return build_state_snapshot()
 
+    def live_status(self):
+        """
+        Return a best-effort state snapshot without blocking behind long motor moves.
+
+        Motion commands intentionally hold _lock for the duration of the operation.
+        The GUI status timer still needs current step/sensor/angle data while those
+        commands are running, so this method only initializes under the lock when it
+        is immediately available; otherwise it reads the already-initialized runtime
+        state directly.
+        """
+        acquired = self._lock.acquire(blocking=False)
+        if acquired:
+            try:
+                initialize_runtime(show_banner=False)
+                return build_state_snapshot()
+            finally:
+                self._lock.release()
+        return build_state_snapshot()
+
     def cancel(self):
         _set_cancel(True)
 
@@ -4197,7 +4251,12 @@ class MonochromatorGUIBackend:
                     pass
 
             camera_props = _zwo_camera_property_dict(asi, int(camera_index))
-            camera_name = camera_props.get("Name") or camera_props.get("name") or f"Camera {int(camera_index)}"
+            camera_name = (
+                _zwo_camera_listed_name(asi, int(camera_index))
+                or camera_props.get("Name")
+                or camera_props.get("name")
+                or f"Camera {int(camera_index)}"
+            )
 
             self._zwo_asi = asi
             self._zwo_camera = camera
@@ -4644,23 +4703,50 @@ class MonochromatorGUIBackend:
         return self._run_with_result(zwo_assisted_reference_capture_with_params, **kwargs)
 
     def scan_wavelength(self, lam1, lam2, order_m, step_nm, **kwargs):
-        return self._run(
-            scan_wavelength,
-            float(lam1),
-            float(lam2),
-            int(order_m),
-            float(step_nm),
-            **kwargs,
-        )
+        def _do_scan():
+            try:
+                return _scan_wavelength_impl(
+                    float(lam1),
+                    float(lam2),
+                    int(order_m),
+                    float(step_nm),
+                    **kwargs,
+                )
+            except TypeError as exc:
+                if "scan_step_delay_ms" not in str(exc):
+                    raise
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs.pop("scan_step_delay_ms", None)
+                return _scan_wavelength_impl(
+                    float(lam1),
+                    float(lam2),
+                    int(order_m),
+                    float(step_nm),
+                    **fallback_kwargs,
+                )
+        return self._run(_do_scan)
 
     def scan_angle(self, theta1_deg, theta2_deg, step_deg, **kwargs):
-        return self._run(
-            scan_angle,
-            float(theta1_deg),
-            float(theta2_deg),
-            float(step_deg),
-            **kwargs,
-        )
+        def _do_scan():
+            try:
+                return _scan_angle_impl(
+                    float(theta1_deg),
+                    float(theta2_deg),
+                    float(step_deg),
+                    **kwargs,
+                )
+            except TypeError as exc:
+                if "scan_step_delay_ms" not in str(exc):
+                    raise
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs.pop("scan_step_delay_ms", None)
+                return _scan_angle_impl(
+                    float(theta1_deg),
+                    float(theta2_deg),
+                    float(step_deg),
+                    **fallback_kwargs,
+                )
+        return self._run(_do_scan)
 
     def shutdown(self):
         global board, it, port, switch1, switch2, last_states, _runtime_initialized
