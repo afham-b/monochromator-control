@@ -47,8 +47,8 @@ class BackendTaskThread(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, fn, *args, **kwargs):
-        super().__init__()
+    def __init__(self, fn, *args, parent=None, **kwargs):
+        super().__init__(parent)
         self._fn = fn
         self._args = args
         self._kwargs = kwargs
@@ -65,8 +65,8 @@ class ZWOLivePreviewThread(QThread):
     frame_ready = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, backend, fps=30.0):
-        super().__init__()
+    def __init__(self, backend, fps=30.0, parent=None):
+        super().__init__(parent)
         self._backend = backend
         self._fps = max(0.5, float(fps))
         self._running = True
@@ -224,7 +224,7 @@ class ZWOFramePreview(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(420, 280)
+        self.setMinimumSize(520, 420)
         self._placeholder_text = "No frame captured."
         self._pixmap = None
         self._frame_width = 0
@@ -494,6 +494,8 @@ class MonochromatorWindow(QMainWindow):
         self._zwo_last_frame_array = None
         self._zwo_last_camera_status = {}
         self._zwo_analysis_local_roi = None
+        self._zwo_last_analysis = None
+        self._owned_qthreads = []
         self._arrow_jog_dialog = None
         self._arrow_jog_dialog_closing = False
         self._cli_jog_dialog = None
@@ -515,7 +517,7 @@ class MonochromatorWindow(QMainWindow):
         self._set_busy(False)
 
         self.status_timer = QTimer(self)
-        self.status_timer.setInterval(750)
+        self.status_timer.setInterval(250)
         self.status_timer.timeout.connect(self._refresh_status_if_idle)
         self.status_timer.start()
         QApplication.instance().installEventFilter(self)
@@ -866,6 +868,14 @@ class MonochromatorWindow(QMainWindow):
         common.addWidget(QLabel("Dwell (s)"), 1, 2)
         common.addWidget(self.scan_dwell_spin, 1, 3)
 
+        self.scan_motor_delay_spin = QDoubleSpinBox()
+        self.scan_motor_delay_spin.setRange(1.0, 1000.0)
+        self.scan_motor_delay_spin.setDecimals(1)
+        self.scan_motor_delay_spin.setSingleStep(1.0)
+        self.scan_motor_delay_spin.setValue(4.0)
+        common.addWidget(QLabel("Motor delay (ms/step)"), 2, 0)
+        common.addWidget(self.scan_motor_delay_spin, 2, 1)
+
         layout.addLayout(common)
 
         self.scan_tabs = QTabWidget()
@@ -952,7 +962,7 @@ class MonochromatorWindow(QMainWindow):
         capture_layout.addWidget(self.zwo_start_live_button, 1, 3)
 
         self.zwo_stop_live_button = QPushButton("Stop Live")
-        self.zwo_stop_live_button.clicked.connect(self._stop_zwo_live_preview)
+        self.zwo_stop_live_button.clicked.connect(self._request_stop_zwo_live_preview)
         capture_layout.addWidget(self.zwo_stop_live_button, 1, 4)
 
         self.zwo_camera_status_summary = QLabel("No camera status available.")
@@ -1002,6 +1012,18 @@ class MonochromatorWindow(QMainWindow):
 
         preview_box = QGroupBox("Live Preview / Analysis")
         preview_box_layout = QVBoxLayout(preview_box)
+        preview_splitter = QSplitter(Qt.Vertical)
+        preview_splitter.setChildrenCollapsible(False)
+        preview_splitter.setHandleWidth(8)
+        preview_splitter.setStyleSheet(
+            "QSplitter::handle { background: #2c2f33; } "
+            "QSplitter::handle:hover { background: #4c5258; }"
+        )
+
+        preview_area = QWidget()
+        preview_area_layout = QVBoxLayout(preview_area)
+        preview_area_layout.setContentsMargins(0, 0, 0, 0)
+
         preview_layout = QHBoxLayout()
 
         self.zwo_preview_label = ZWOFramePreview()
@@ -1011,44 +1033,6 @@ class MonochromatorWindow(QMainWindow):
         side_panel = QWidget()
         side_layout = QVBoxLayout(side_panel)
         side_layout.setContentsMargins(0, 0, 0, 0)
-
-        zwo_jog_box = QGroupBox("Jog While Viewing")
-        zwo_jog_layout = QVBoxLayout(zwo_jog_box)
-
-        zwo_speed_row = QHBoxLayout()
-        zwo_speed_row.addWidget(QLabel("Jog speed (ms)"))
-        self.zwo_jog_speed_spin = QSpinBox()
-        self.zwo_jog_speed_spin.setRange(1, 1000)
-        self.zwo_jog_speed_spin.setValue(1)
-        zwo_speed_row.addWidget(self.zwo_jog_speed_spin)
-        self.zwo_apply_jog_speed_button = QPushButton("Apply")
-        self.zwo_apply_jog_speed_button.clicked.connect(self._apply_zwo_jog_speed)
-        zwo_speed_row.addWidget(self.zwo_apply_jog_speed_button)
-        zwo_jog_layout.addLayout(zwo_speed_row)
-
-        zwo_jog_row = QHBoxLayout()
-        self.zwo_ccw_button = QPushButton("CCW Step / Hold")
-        self.zwo_ccw_button.pressed.connect(lambda: self._on_jog_button_pressed(-1))
-        self.zwo_ccw_button.released.connect(lambda: self._on_jog_button_released(-1))
-        zwo_jog_row.addWidget(self.zwo_ccw_button)
-
-        self.zwo_cw_button = QPushButton("CW Step / Hold")
-        self.zwo_cw_button.pressed.connect(lambda: self._on_jog_button_pressed(+1))
-        self.zwo_cw_button.released.connect(lambda: self._on_jog_button_released(+1))
-        zwo_jog_row.addWidget(self.zwo_cw_button)
-        zwo_jog_layout.addLayout(zwo_jog_row)
-
-        self.zwo_stop_jog_button = QPushButton("Stop")
-        self.zwo_stop_jog_button.clicked.connect(self._stop_mouse_hold_jog)
-        zwo_jog_layout.addWidget(self.zwo_stop_jog_button)
-
-        zwo_jog_hint = QLabel(
-            "Click once for one step. Hold for continuous jog. Release or press Stop to halt motion."
-        )
-        zwo_jog_hint.setWordWrap(True)
-        zwo_jog_layout.addWidget(zwo_jog_hint)
-
-        side_layout.addWidget(zwo_jog_box)
 
         self.zwo_camera_info_output = QPlainTextEdit()
         self.zwo_camera_info_output.setReadOnly(True)
@@ -1064,7 +1048,8 @@ class MonochromatorWindow(QMainWindow):
         side_layout.addWidget(self.zwo_camera_info_output, 1)
 
         preview_layout.addWidget(side_panel, 1)
-        preview_box_layout.addLayout(preview_layout)
+        preview_area_layout.addLayout(preview_layout, 1)
+        preview_splitter.addWidget(preview_area)
 
         profile_box = QGroupBox("Line / Slit Profile")
         profile_layout = QVBoxLayout(profile_box)
@@ -1159,8 +1144,13 @@ class MonochromatorWindow(QMainWindow):
         profile_stats.addWidget(self.zwo_profile_axis_label, 3, 1)
         profile_layout.addLayout(profile_stats)
 
-        preview_box_layout.addWidget(profile_box)
+        preview_splitter.addWidget(profile_box)
+        preview_splitter.setStretchFactor(0, 3)
+        preview_splitter.setStretchFactor(1, 1)
+        preview_splitter.setSizes([720, 260])
+        preview_splitter.handle(1).setCursor(Qt.SplitVCursor)
 
+        preview_box_layout.addWidget(preview_splitter)
         layout.addWidget(preview_box)
         return tab
 
@@ -1782,8 +1772,6 @@ class MonochromatorWindow(QMainWindow):
             self.jog_steps_spin,
             self.jog_speed_spin,
             self.apply_speed_button,
-            self.zwo_jog_speed_spin,
-            self.zwo_apply_jog_speed_button,
             self.disk_home_button,
             self.reset_disk_home_button,
             self.optical_home_button,
@@ -1804,6 +1792,7 @@ class MonochromatorWindow(QMainWindow):
             self.scan_pingpong,
             self.scan_rehome,
             self.scan_dwell_spin,
+            self.scan_motor_delay_spin,
             self.scan_lam_start,
             self.scan_lam_end,
             self.scan_lam_order,
@@ -1868,7 +1857,6 @@ class MonochromatorWindow(QMainWindow):
         ]:
             widget.setEnabled(bool(idle and not live_active))
 
-        zwo_jog_speed_enabled = bool(ready and not self._closing and not self._busy and not task_active and not self._mouse_jog_active)
         zwo_camera_connected = bool(self._zwo_last_camera_status.get("connected"))
         zwo_has_selected_roi = bool(self._zwo_last_frame_array is not None and self._zwo_analysis_local_roi is not None)
         zwo_settings_enabled = bool(
@@ -1882,18 +1870,14 @@ class MonochromatorWindow(QMainWindow):
             ready
             and zwo_camera_connected
             and self._zwo_last_frame_array is not None
+            and self._zwo_analysis_can_center()
             and not self._busy
             and not task_active
             and not self._closing
         )
-        self.zwo_jog_speed_spin.setEnabled(zwo_jog_speed_enabled)
-        self.zwo_apply_jog_speed_button.setEnabled(zwo_jog_speed_enabled)
         self.ccw_button.setEnabled(jog_button_enabled)
         self.cw_button.setEnabled(jog_button_enabled)
         self.stop_jog_button.setEnabled(bool(ready and not self._closing and self._mouse_jog_active))
-        self.zwo_ccw_button.setEnabled(jog_button_enabled)
-        self.zwo_cw_button.setEnabled(jog_button_enabled)
-        self.zwo_stop_jog_button.setEnabled(bool(ready and not self._closing and self._mouse_jog_active))
         self.zwo_camera_exposure_spin.setEnabled(zwo_settings_enabled)
         self.zwo_camera_gain_spin.setEnabled(zwo_settings_enabled)
         self.zwo_apply_settings_button.setEnabled(zwo_settings_enabled)
@@ -2094,6 +2078,7 @@ class MonochromatorWindow(QMainWindow):
     def _set_zwo_preview_text(self, text):
         self._zwo_last_frame_array = None
         self._zwo_analysis_local_roi = None
+        self._zwo_last_analysis = None
         self.zwo_preview_label.set_placeholder_text(text)
         self.zwo_profile_plot.set_profile(None)
         self.zwo_profile_roi_label.setText("Analysis ROI: full visible frame")
@@ -2256,6 +2241,7 @@ class MonochromatorWindow(QMainWindow):
 
     def _refresh_zwo_analysis_view(self):
         if self._zwo_last_frame_array is None:
+            self._zwo_last_analysis = None
             self.zwo_profile_plot.set_profile(None)
             self.zwo_profile_roi_label.setText("Analysis ROI: full visible frame")
             self.zwo_profile_peak_label.setText("Peak: --")
@@ -2268,6 +2254,7 @@ class MonochromatorWindow(QMainWindow):
             return
 
         if np is None:
+            self._zwo_last_analysis = None
             self.zwo_profile_plot.set_profile(None)
             self.zwo_profile_roi_label.setText("Analysis ROI: NumPy not available")
             self.zwo_profile_peak_label.setText("Peak: --")
@@ -2295,38 +2282,46 @@ class MonochromatorWindow(QMainWindow):
 
         region = frame_array[y : y + height, x : x + width]
         if region.size == 0:
+            self._zwo_last_analysis = None
             self.zwo_profile_plot.set_profile(None)
             return
 
         axis = self._current_zwo_profile_axis()
         axis_label = "Horizontal" if axis == "x" else "Vertical"
-        region_f = region.astype(np.float64, copy=False)
-        profile = region_f.sum(axis=0 if axis == "x" else 1)
-        if profile.size == 0:
+        try:
+            analysis = backend_module._zwo_profile_analysis(
+                frame_array,
+                axis=axis,
+                roi=local_roi,
+                feature="centroid",
+            )
+        except BaseException:
+            self._zwo_last_analysis = None
             self.zwo_profile_plot.set_profile(None)
             return
 
-        peak_index = int(np.argmax(profile))
-        peak_value = float(profile[peak_index])
-        total_intensity = float(profile.sum())
-        centroid_index = None
-        if total_intensity > 0.0:
-            coords = np.arange(profile.size, dtype=np.float64)
-            centroid_index = float((coords * profile).sum() / total_intensity)
-
-        sensor_roi = self._zwo_local_to_sensor_roi((x, y, width, height))
-        sensor_x, sensor_y, _, _ = sensor_roi if sensor_roi is not None else (x, y, width, height)
+        self._zwo_last_analysis = analysis
+        profile = analysis.get("profile") or []
+        peak_index = int(analysis.get("peak_index", 0))
+        peak_value = float(analysis.get("peak_value", 0.0))
+        total_intensity = float(analysis.get("integrated_intensity", 0.0))
+        centroid_index = analysis.get("centroid_index")
+        sensor_roi_info = analysis.get("roi") or {}
+        sensor_x = int(sensor_roi_info.get("x", x))
+        sensor_y = int(sensor_roi_info.get("y", y))
         peak_sensor = (sensor_x + peak_index) if axis == "x" else (sensor_y + peak_index)
-        centroid_sensor = None if centroid_index is None else ((sensor_x + centroid_index) if axis == "x" else (sensor_y + centroid_index))
+        centroid_sensor = analysis.get("feature_sensor_position") if axis == "x" and centroid_index is not None else None
+        if axis == "y" and centroid_index is not None:
+            centroid_sensor = analysis.get("feature_sensor_position")
 
         self.zwo_profile_plot.set_profile(
-            profile.tolist(),
+            profile,
             peak_index=peak_index,
             centroid_index=centroid_index,
             axis_label=axis_label,
         )
         self.zwo_profile_roi_label.setText(
-            f"Analysis ROI: sensor ({sensor_x}, {sensor_y}) {width} x {height}"
+            f"Analysis ROI: sensor ({sensor_x}, {sensor_y}) {int(sensor_roi_info.get('width', width))} x {int(sensor_roi_info.get('height', height))}"
         )
         axis_name = "X" if axis == "x" else "Y"
         self.zwo_profile_peak_label.setText(
@@ -2340,11 +2335,18 @@ class MonochromatorWindow(QMainWindow):
             )
         self.zwo_profile_peak_value_label.setText(f"Peak value: {peak_value:.1f}")
         self.zwo_profile_integrated_label.setText(f"Integrated intensity: {total_intensity:.1f}")
-        self.zwo_profile_mean_label.setText(f"Mean DN: {float(region_f.mean()):.3f}")
-        self.zwo_profile_axis_label.setText(f"Axis: {axis_label}")
+        mean_dn = analysis.get("mean_dn")
+        signal_ok = analysis.get("signal_present", False)
+        self.zwo_profile_mean_label.setText(f"Mean DN: {float(mean_dn):.3f}" if mean_dn is not None else "Mean DN: --")
+        axis_extra = "signal OK" if signal_ok else "no clear signal"
+        self.zwo_profile_axis_label.setText(f"Axis: {axis_label} | {axis_extra}")
 
     def _current_zwo_analysis_roi_for_backend(self):
         return self._normalize_zwo_analysis_local_roi(self._zwo_last_frame_array, self._zwo_analysis_local_roi)
+
+    def _zwo_analysis_can_center(self):
+        analysis = self._zwo_last_analysis if isinstance(self._zwo_last_analysis, dict) else None
+        return bool(analysis and analysis.get("signal_present"))
 
     def _clear_selected_preview_roi(self):
         self._zwo_analysis_local_roi = None
@@ -2371,7 +2373,8 @@ class MonochromatorWindow(QMainWindow):
         self._populate_zwo_roi_inputs(sensor_roi)
         self.zwo_camera_info_output.setPlainText(
             "Applying selected preview ROI to the camera.\n"
-            "Live preview will stop, crop the camera stream, then resume."
+            "Live preview will stop, the camera ROI will be updated,\n"
+            "and live preview will restart automatically."
         )
         self._apply_zwo_camera_roi(from_selected_preview=True)
 
@@ -2381,15 +2384,27 @@ class MonochromatorWindow(QMainWindow):
         if self._zwo_last_frame_array is None:
             QMessageBox.warning(self, "ZWO centering", "Capture or stream a frame before using centering assist.")
             return
-        self._zwo_resume_live_after_center = bool(self._zwo_live_thread is not None)
-        if self._zwo_resume_live_after_center and not self._ensure_zwo_live_preview_stopped(
+        if not self._zwo_analysis_can_center():
+            QMessageBox.warning(
+                self,
+                "ZWO centering",
+                "No clear spectral feature is visible in the selected ROI.\n\n"
+                "Start live preview, illuminate the slit or line, and tighten the ROI around the feature before using centering assist.",
+            )
+            return
+        was_live_running = bool(self._zwo_live_thread is not None)
+        self._zwo_resume_live_after_center = was_live_running
+        if was_live_running and not self._ensure_zwo_live_preview_stopped(
             context="starting centering assist"
         ):
             self._zwo_resume_live_after_center = False
             return
         axis = self._current_zwo_profile_axis()
         label = "Center on centroid" if str(feature).lower() == "centroid" else "Center on peak"
-        self.zwo_camera_info_output.setPlainText(f"{label} assist running...")
+        self.zwo_camera_info_output.setPlainText(
+            f"{label} assist running...\n"
+            "Live preview is paused for stability and will restart automatically when the assist completes."
+        )
         self._run_task(
             label,
             self.backend.center_zwo_feature,
@@ -2570,8 +2585,9 @@ class MonochromatorWindow(QMainWindow):
         roi = self._validate_zwo_roi_inputs()
         if roi is None:
             return
-        self._zwo_resume_live_after_roi_change = bool(self._zwo_live_thread is not None)
-        if not self._ensure_zwo_live_preview_stopped(context="changing the ZWO ROI"):
+        was_live_running = bool(self._zwo_live_thread is not None)
+        self._zwo_resume_live_after_roi_change = was_live_running
+        if was_live_running and not self._ensure_zwo_live_preview_stopped(context="changing the ZWO ROI"):
             self._zwo_resume_live_after_roi_change = False
             return
         label = "Apply Selected ZWO ROI" if from_selected_preview else "Apply ZWO ROI"
@@ -2590,8 +2606,9 @@ class MonochromatorWindow(QMainWindow):
             return
         self._zwo_analysis_local_roi = None
         self._refresh_zwo_analysis_view()
-        self._zwo_resume_live_after_roi_change = bool(self._zwo_live_thread is not None)
-        if not self._ensure_zwo_live_preview_stopped(context="resetting the ZWO ROI"):
+        was_live_running = bool(self._zwo_live_thread is not None)
+        self._zwo_resume_live_after_roi_change = was_live_running
+        if was_live_running and not self._ensure_zwo_live_preview_stopped(context="resetting the ZWO ROI"):
             self._zwo_resume_live_after_roi_change = False
             return
         self._run_task(
@@ -2601,7 +2618,13 @@ class MonochromatorWindow(QMainWindow):
         )
 
     def _start_zwo_live_preview(self):
-        if self.backend is None or self._busy or self._closing or self._zwo_live_thread is not None:
+        if (
+            self.backend is None
+            or self._busy
+            or self._task_is_active()
+            or self._closing
+            or self._zwo_live_thread is not None
+        ):
             return
         try:
             status = self.backend.get_zwo_camera_status()
@@ -2622,7 +2645,9 @@ class MonochromatorWindow(QMainWindow):
         self._zwo_live_last_frame_ts = None
         self._zwo_live_actual_fps = None
         self._zwo_live_info_last_update_ts = None
-        self._zwo_live_thread = ZWOLivePreviewThread(self.backend, fps=self.zwo_live_fps_spin.value())
+        self._zwo_live_thread = ZWOLivePreviewThread(self.backend, fps=self.zwo_live_fps_spin.value(), parent=self)
+        self._zwo_live_thread.setObjectName("zwo_live_preview")
+        self._owned_qthreads.append(self._zwo_live_thread)
         self._zwo_live_thread.frame_ready.connect(self._on_zwo_live_frame_ready)
         self._zwo_live_thread.failed.connect(self._on_zwo_live_failed)
         self._zwo_live_thread.finished.connect(self._on_zwo_live_finished)
@@ -2647,6 +2672,20 @@ class MonochromatorWindow(QMainWindow):
             return not thread.isRunning()
         return True
 
+    def _request_stop_zwo_live_preview(self):
+        if self._zwo_live_thread is None:
+            return
+        self.zwo_camera_info_output.setPlainText("Stopping live preview...")
+        self._log("[GUI] Stop requested for ZWO live preview")
+        stopped = self._stop_zwo_live_preview(wait=True, timeout_ms=4000)
+        if not stopped and not self._closing:
+            message = (
+                "Live preview did not stop cleanly.\n\n"
+                "Wait a moment and try again."
+            )
+            self.zwo_camera_info_output.setPlainText(message)
+            QMessageBox.warning(self, "ZWO live preview", message)
+
     def _ensure_zwo_live_preview_stopped(self, *, context, timeout_ms=5000):
         if self._zwo_live_thread is None:
             return True
@@ -2665,6 +2704,11 @@ class MonochromatorWindow(QMainWindow):
     def _on_zwo_live_frame_ready(self, payload):
         if not isinstance(payload, dict):
             return
+        thread = self.sender()
+        if self._zwo_live_stop_requested or self._zwo_live_thread is None:
+            return
+        if thread is not None and thread is not self._zwo_live_thread:
+            return
         now = time.monotonic()
         if self._zwo_live_last_frame_ts is not None:
             dt = now - self._zwo_live_last_frame_ts
@@ -2677,6 +2721,7 @@ class MonochromatorWindow(QMainWindow):
         self._zwo_live_last_frame_ts = now
         self._apply_zwo_status_to_view(payload.get("status", {}))
         self._set_zwo_preview_from_array(payload.get("frame_array"))
+        self._refresh_control_states()
         if self._zwo_live_info_last_update_ts is None or (now - self._zwo_live_info_last_update_ts) >= 0.20:
             self._zwo_live_info_last_update_ts = now
             actual_fps_text = "--" if self._zwo_live_actual_fps is None else f"{self._zwo_live_actual_fps:.1f}"
@@ -2690,6 +2735,13 @@ class MonochromatorWindow(QMainWindow):
             )
 
     def _on_zwo_live_failed(self, error_text):
+        thread = self.sender()
+        if self._zwo_live_stop_requested:
+            return
+        if self._zwo_live_thread is None:
+            return
+        if thread is not None and thread is not self._zwo_live_thread:
+            return
         self._zwo_live_error_seen = True
         self.zwo_camera_info_output.setPlainText(error_text)
         self._log("[GUI] ZWO live preview failed")
@@ -2701,7 +2753,18 @@ class MonochromatorWindow(QMainWindow):
     def _on_zwo_live_finished(self):
         thread = self.sender()
         if thread is not None:
+            if thread in self._owned_qthreads:
+                self._owned_qthreads.remove(thread)
             thread.deleteLater()
+        if self._zwo_live_thread is None:
+            self._zwo_live_stop_requested = False
+            self._zwo_live_error_seen = False
+            self._zwo_live_last_frame_ts = None
+            self._zwo_live_actual_fps = None
+            self._zwo_live_info_last_update_ts = None
+            return
+        if thread is not None and thread is not self._zwo_live_thread:
+            return
         self._zwo_live_thread = None
         self._refresh_control_states()
         if self._closing:
@@ -2790,13 +2853,15 @@ class MonochromatorWindow(QMainWindow):
         if self.backend is None:
             QMessageBox.warning(self, "Controller not ready", "Initialize the controller backend first.")
             return
-        if self._busy or self._closing:
+        if self._busy or self._task_is_active() or self._closing:
             return
         self._set_busy(True, f"{label}...")
         self._active_task_kind = task_kind
         if log_message:
             self._log(f"[GUI] {label}")
-        self._task_thread = BackendTaskThread(fn, *args, **kwargs)
+        self._task_thread = BackendTaskThread(fn, *args, parent=self, **kwargs)
+        self._task_thread.setObjectName(f"backend_task:{task_kind}")
+        self._owned_qthreads.append(self._task_thread)
         self._task_thread.succeeded.connect(self._task_succeeded)
         self._task_thread.failed.connect(self._task_failed)
         self._task_thread.finished.connect(self._task_finished)
@@ -2981,6 +3046,8 @@ class MonochromatorWindow(QMainWindow):
             self._task_thread = None
             self._active_task_kind = None
         if thread is not None:
+            if thread in self._owned_qthreads:
+                self._owned_qthreads.remove(thread)
             thread.deleteLater()
         self._refresh_control_states()
         if not self._closing and self.backend is not None and not self._is_jog_active():
@@ -3029,8 +3096,19 @@ class MonochromatorWindow(QMainWindow):
             self._log(error_text)
 
     def _refresh_status_if_idle(self):
-        if self.backend is not None and not self._busy and not self._task_is_active() and not self._is_jog_active():
-            self._refresh_status_manual()
+        if self.backend is None or self._closing or self._is_jog_active():
+            return
+
+        if self._busy or self._task_is_active():
+            try:
+                self._update_status(self.backend.live_status())
+            except BaseException:
+                # Live status is best-effort during motion; do not interrupt
+                # homing, scans, or centering for a display refresh failure.
+                pass
+            return
+
+        self._refresh_status_manual()
 
     def _start_cli_jog(self):
         if self.backend is None or self._busy or self._task_is_active() or self._closing or self.arrow_jog_checkbox.isChecked():
@@ -3069,11 +3147,6 @@ class MonochromatorWindow(QMainWindow):
             self._pending_jog_speed_ms = new_ms
             return
         self._run_task("Set jog speed", self.backend.set_jog_speed_ms, new_ms)
-
-    def _apply_zwo_jog_speed(self):
-        if hasattr(self, "jog_speed_spin"):
-            self.jog_speed_spin.setValue(self.zwo_jog_speed_spin.value())
-        self._apply_jog_speed()
 
     def _adjust_jog_speed(self, delta_ms):
         new_ms = max(1, min(1000, self.jog_speed_spin.value() + int(delta_ms)))
@@ -3145,7 +3218,12 @@ class MonochromatorWindow(QMainWindow):
             self.backend.stop_cli_jog_mode()
             self._log("[GUI] CLI jog stop requested")
             return
+        if self._zwo_live_thread is not None and not self._task_is_active():
+            self._request_stop_zwo_live_preview()
+            return
         self.backend.cancel()
+        if self._active_task_kind == "zwo_center_feature":
+            self.zwo_camera_info_output.setPlainText("Cancelling centering assist...")
         self._log("[GUI] Cancel requested")
 
     def _shutdown_backend(self):
@@ -3193,6 +3271,7 @@ class MonochromatorWindow(QMainWindow):
             "mode": self.scan_mode_combo.currentData(),
             "repeats": self.scan_repeats_spin.value(),
             "dwell_s": self.scan_dwell_spin.value(),
+            "scan_step_delay_ms": self.scan_motor_delay_spin.value(),
             "rehome_each_repeat": self.scan_rehome.isChecked(),
             "pingpong": self.scan_pingpong.isChecked(),
         }
@@ -3414,12 +3493,6 @@ class MonochromatorWindow(QMainWindow):
 
         if jog_speed_ms is not None and not self._widget_or_child_has_focus(self.jog_speed_spin):
             self.jog_speed_spin.setValue(int(jog_speed_ms))
-        if (
-            jog_speed_ms is not None
-            and hasattr(self, "zwo_jog_speed_spin")
-            and not self._widget_or_child_has_focus(self.zwo_jog_speed_spin)
-        ):
-            self.zwo_jog_speed_spin.setValue(int(jog_speed_ms))
 
     def closeEvent(self, event):
         if self._shutdown_complete:
