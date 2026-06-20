@@ -788,6 +788,7 @@ class MonochromatorWindow(QMainWindow):
         self._mouse_jog_hold_timer.setSingleShot(True)
         self._mouse_jog_hold_timer.timeout.connect(self._begin_mouse_hold_jog)
 
+
         self._refresh_ports(preserve_selection=False)
         self._set_backend_ready(False)
         self._set_busy(False)
@@ -802,7 +803,8 @@ class MonochromatorWindow(QMainWindow):
         self.quit_shortcut.activated.connect(self.close)
         self.close_shortcut = QShortcut(QKeySequence.StandardKey.Close, self)
         self.close_shortcut.activated.connect(self.close)
-        QTimer.singleShot(250, self._auto_initialize_controller_once)
+        # Do not auto-initialize hardware on startup; bad/missing ports can block the GUI.
+        # User should select/refresh the port and click Initialize Controller manually.
 
     def _build_ui(self):
         central = QWidget()
@@ -3561,7 +3563,8 @@ class MonochromatorWindow(QMainWindow):
                     self.backend = None
             if self.backend is None:
                 self.backend = backend_module.MonochromatorGUIBackend()
-            snapshot = self.backend.initialize(selected_port)
+            init_timeout_s = 30.0 if auto_start else 10.0
+            snapshot = self.backend.initialize(selected_port, timeout_s=init_timeout_s)
             ready_port = snapshot.get("port") or init_target
             self._set_busy(False, f"Controller ready on {ready_port}.")
             self._set_backend_ready(True)
@@ -4287,6 +4290,7 @@ class MonochromatorWindow(QMainWindow):
             self._log("[GUI] Close delayed: ZWO live preview thread is still shutting down")
             event.ignore()
             return
+
 
         if self.backend is not None and self._task_thread is not None and self._task_thread.isRunning():
             self._log("[GUI] Close requested; cancelling active operation")

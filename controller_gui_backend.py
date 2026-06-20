@@ -222,18 +222,27 @@ def _candidate_arduino_ports_for_init(preferred=None):
     add_candidate("COM10" if platform.system() == "Windows" else "/dev/cu.usbmodem1101")
     return candidates
 
-def _pick_working_arduino_port(preferred=None):
+def _pick_working_arduino_port(preferred=None, timeout_s=None):
     candidates = _candidate_arduino_ports_for_init(preferred)
+    deadline = None if timeout_s is None else time.monotonic() + max(0.5, float(timeout_s))
     probe_errors = []
     for candidate in candidates:
-        ok, error_text = _probe_arduino_port(candidate)
+        probe_timeout = ARDUINO_PROBE_PROCESS_TIMEOUT_S
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                probe_errors.append(f"{candidate}: Skipped because initialization timed out.")
+                break
+            probe_timeout = min(probe_timeout, max(0.5, remaining))
+        ok, error_text = _probe_arduino_port(candidate, timeout_s=probe_timeout)
         if ok:
             return candidate
         probe_errors.append(f"{candidate}: {error_text}")
 
     detail = "\n".join(f"  - {line}" for line in probe_errors) if probe_errors else "  - No candidate ports were available."
+    timeout_note = f" after {float(timeout_s):.1f}s" if timeout_s is not None else ""
     raise RuntimeError(
-        "Could not find a responsive Arduino/Firmata port.\n"
+        f"Could not find a responsive Arduino/Firmata port{timeout_note}.\n"
         "Please choose the correct port and try again.\n"
         "Probe results:\n"
         f"{detail}"
@@ -257,12 +266,12 @@ switch2 = None
 # use to initialize an array to track the switch states
 last_states = [None, None]
 
-def _init_board(preferred_port=None):
+def _init_board(preferred_port=None, init_timeout_s=None):
     global port, board, it, switch1, switch2, last_states
     if board is not None:
         return board
 
-    port = _pick_working_arduino_port(preferred_port or PORT_OVERRIDE)
+    port = _pick_working_arduino_port(preferred_port or PORT_OVERRIDE, timeout_s=init_timeout_s)
     try:
         board = Arduino(port, timeout=ARDUINO_PROBE_SERIAL_TIMEOUT_S)
     except Exception as e:
@@ -3851,9 +3860,15 @@ def goto_menu():
         print(f"Done. Current step_count = {step_count}")
 
 
-def wait_for_initial_sensor_states():
+def wait_for_initial_sensor_states(timeout_s=5.0):
     global switch1, switch2
+    deadline = time.monotonic() + max(0.5, float(timeout_s))
     while switch1 is None or switch2 is None:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Timed out waiting for initial sensor states from the Arduino. "
+                "Check that the selected port is the Firmata Arduino and that S1/S2 wiring is connected."
+            )
         switch1 = board.digital[optical_pin].read()
         switch2 = board.digital[optical_pin2].read()
         time.sleep(0.01)  # Wait briefly
@@ -3952,7 +3967,7 @@ def _load_optical_offset():
         print(f"[Persist] Could not read {OPTICAL_OFFSET_FILE} ({e}); defaulting to 0")
         OPTICAL_HOME_OFFSET_STEPS = 0
 
-def initialize_runtime(*, show_banner=True, preferred_port=None):
+def initialize_runtime(*, show_banner=True, preferred_port=None, init_timeout_s=None):
     """
     Initialize hardware/runtime state once so the backend can be safely imported by a GUI.
     """
@@ -3963,9 +3978,13 @@ def initialize_runtime(*, show_banner=True, preferred_port=None):
         if _runtime_initialized:
             return build_state_snapshot()
 
-        _init_board(preferred_port)
-        WL = load_wl_cal(STATE_DIR)   # {"refs":[...], "model": {...} or None}
-        wait_for_initial_sensor_states()
+        try:
+            _init_board(preferred_port, init_timeout_s=init_timeout_s)
+            WL = load_wl_cal(STATE_DIR)   # {"refs":[...], "model": {...} or None}
+            wait_for_initial_sensor_states(timeout_s=5.0)
+        except BaseException:
+            shutdown_runtime()
+            raise
         setup_logging()
         _load_persisted_step_count()
         _load_persisted_jog_speed()
@@ -4088,9 +4107,9 @@ class MonochromatorGUIBackend:
         with self._lock:
             return list_available_serial_ports()
 
-    def initialize(self, preferred_port=None):
+    def initialize(self, preferred_port=None, timeout_s=None):
         with self._lock:
-            return initialize_runtime(show_banner=False, preferred_port=preferred_port)
+            return initialize_runtime(show_banner=False, preferred_port=preferred_port, init_timeout_s=timeout_s)
 
     def status(self):
         with self._lock:

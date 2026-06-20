@@ -19,22 +19,67 @@ Python-based control and calibration tooling for a stepper-driven monochromator 
 
 Wiring and system documentation:
 - `Monochromator Documentation.pdf`
+- `GUI_Documentation_Addendum.md`
 - `VM-504 SD3 (V2.A) (1).pdf`
 - `complete system wiring.png`
 - `Stepper Controller Wiring Diagram.png`
 - `opticalswitch_diagram.png`
 - `Dual Switch wiring.png`
 
-## Software
-- Python 3.9+ (tested on 3.13)
-- `pyfirmata`, `pyserial`, `pynput`
-- Optional: `keyboard` (some Windows setups)
+The GUI addendum contains the newer desktop GUI installation notes, ZWO camera setup, common GUI errors, and a feature-by-feature guide for the control, calibration, scan, and camera panes.
 
-Install:
+## Software
+Python:
+- Python 3.9+ (tested on 3.13)
+
+Core controller packages:
+- `pyfirmata`
+- `pyserial`
+- `pynput`
+
+GUI packages:
+- `PySide6`
+
+Optional packages:
+- `keyboard` for some Windows keyboard-hook setups
+- `numpy` for ZWO live analysis features such as line profiles, centroid, peak finding, and ROI-assisted analysis
+- `zwoasi` for the ZWO camera pane
+
+macOS / ZWO camera dependencies:
+- `libusb` installed through Homebrew
+- ZWO ASI SDK `libASICamera2.dylib`
+- On Apple Silicon Macs, use the `mac_arm64` SDK library, not the older Intel-only `mac` build
+
+Recommended GUI install:
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install pyfirmata pyserial pynput PySide6
+python -m pip install numpy
+python -m pip install zwoasi
+```
+
+CLI-only install:
 ```bash
 python -m pip install pyfirmata pyserial pynput
 # optional (Windows)
 python -m pip install keyboard
+```
+
+macOS ZWO camera install notes:
+```bash
+brew install libusb
+```
+
+If the ZWO SDK is not auto-detected, set the SDK path in the GUI or export it before launching:
+```bash
+export ZWO_ASI_LIB="/full/path/to/libASICamera2.dylib"
+```
+
+Apple Silicon example:
+```bash
+export ZWO_ASI_LIB="$HOME/Downloads/ASI_Camera_SDK/ASI_linux_mac_SDK_V1.41/lib/mac_arm64/libASICamera2.dylib"
 ```
 
 ## Quick Start
@@ -47,7 +92,11 @@ export ARDUINO_PORT=/dev/cu.usbmodem1101
 # Windows (opens new terminal afterward)
 setx ARDUINO_PORT COM5
 ```
-4. Run the controller:
+4. Run the desktop GUI:
+```bash
+python monochromator_gui.py
+```
+5. Or run the original CLI controller:
 ```bash
 python controller.py
 ```
@@ -87,4 +136,3 @@ Suggested first-time flow:
 - `stepper.py`, `stepper_mac.py`: simpler stepper test harnesses.
 - `monochromator.py`: serial control for SD3 monochromator commands.
 - `carousel.py`, `laser_serial.py`, `serial_generic.py`: auxiliary serial tools.
-

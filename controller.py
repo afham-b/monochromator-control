@@ -4,7 +4,9 @@
 #windows may need this in terminal: setx ARDUINO_PORT COM5
 
 
+import builtins
 import os, sys, time, math, logging, platform, json
+from collections import deque
 from datetime import datetime
 from pyfirmata import Arduino, util
 
@@ -56,9 +58,30 @@ def drain_stdin():
         except Exception:
             pass
 
+INPUT_SETTLE_DELAY_S = 0.05
+
+def settle_terminal_input(delay=INPUT_SETTLE_DELAY_S):
+    """Give listener-delivered keystrokes time to land, then flush stdin."""
+    try:
+        time.sleep(max(0.0, float(delay)))
+    finally:
+        drain_stdin()
+
+def clean_input(prompt=""):
+    drain_stdin()
+    return builtins.input(prompt)
+
+input = clean_input
+
 def prompt_cmd(prompt):
     drain_stdin()
     return input(prompt).strip().upper()
+
+def _make_keyboard_listener(*, on_press=None, on_release=None):
+    try:
+        return pynput_keyboard.Listener(on_press=on_press, on_release=on_release, suppress=True)
+    except TypeError:
+        return pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
 
 
 def _pick_arduino_port(preferred=None):
@@ -131,8 +154,8 @@ board.digital[optical_pin2].mode = 0
 switch1 = board.digital[optical_pin].read()
 #switch 2 is for the larger worm gear 
 switch2 = board.digital[optical_pin2].read()
-#use to initialize an array to track the switch states 
-last_states = ["", ""]
+# use to initialize an array to track the switch states
+last_states = [None, None]
 
 
 # attempting directional bias & backlash compensation
@@ -155,8 +178,22 @@ last_switch1_state = None
 last_switch2_state = None
 transition_sequence = []
 
-# determined by calibration
-steps_per_rev = 100
+# Legacy controller logic treated one software "step" as a full 8-state sequence cycle.
+# We now count each electrical half-step directly, so old hand-tuned motion distances
+# need to be scaled by this factor to preserve the same physical travel.
+LEGACY_STEP_SCALE = 8
+
+def _legacy_steps(n):
+    return int(round(float(n) * LEGACY_STEP_SCALE))
+
+# Hardware/sign convention:
+#   stage CW  = positive
+#   stage CCW = negative
+# The current ULN2003 sequence order is treated as CW-positive.
+MOTOR_SEQUENCE_SIGN = +1
+
+# determined by calibration; 0.9° motor => ~800 half-steps/rev
+steps_per_rev = 800
 # it takes 205 revs + 40 steps for one full gear rotations.
 revs_per_rotation = 180 
 delta_steps = 40
@@ -177,25 +214,46 @@ _last_s1_open = None         # last boolean state of S1 (True=open, False=blocke
 _first_rising_captured = False
 _last_rising_stepcount = 0   # step_count at last rising edge
 _steps_since_any_edge = 0    # edge holdoff counter to avoid double-trigger at boundary
-EDGE_HOLDOFF_STEPS = 6       # min steps between edges to consider another edge valid
+EDGE_HOLDOFF_STEPS = _legacy_steps(6)       # min half-steps between edges to consider another edge valid
 
 
 #Homing config
-HOME_OFFSET_DIR = {+1: 20, -1: 20}  # steps from S2 center toward the approach_dir to exact home
+HOME_DEFAULT_APPROACH_DIR = +1
+HOME_OFFSET_DIR = {+1: 0, -1: 0}  # additional half-steps from S2 center toward exact home; keep zero unless measured
 FAST_STEP_DELAY   = 0.001
 EDGE_STEP_DELAY   = 0.004
 CENTER_STEP_DELAY = 0.006
 TWEAK_STEP_DELAY  = 0.008
-MAX_FIND_STEPS    = 20000       # hard cap so loops can't run forever
-TWEAK_RANGE       = 100           # +/- small steps to satisfy "both open"
-FAR_STEP_THRESHOLD = 200   # steps to consider "far" for fast pre-roll
-REHOME_BUMP_STEPS  = 100   # how far to leave the OPEN window when already at home
+MAX_FIND_STEPS    = _legacy_steps(20000)       # hard cap so loops can't run forever
+TWEAK_RANGE       = _legacy_steps(100)         # +/- bounded half-step search to satisfy "both open"
+FAR_STEP_THRESHOLD = _legacy_steps(200)        # half-steps to consider "far" for fast pre-roll
+REHOME_BUMP_STEPS  = _legacy_steps(100)        # half-steps to leave the OPEN window when already at home
+FIXED_FINAL_APPROACH_DIR = +1    # tune this to the preferred final arrival direction on S2
+FIXED_FINAL_APPROACH_BACKOFF_STEPS = _legacy_steps(30)  # should exceed S2 backlash for shortest-path moves
+PERSIST_EVERY_STEPS = _legacy_steps(10)  # persist at least every legacy-10-step equivalent during long moves
+PERSIST_EVERY_SECONDS = 0.25
+_last_persist_step = 0
+_last_persist_time = 0.0
+DEBUG_MOTION_LOGGING = False     # True -> log sensor snapshot on every monitor_sensors() call
+DEBUG_TERMINAL_OUTPUT = False    # True -> print sensor snapshot on every monitor_sensors() call
+JOG_STREAM_SENSORS = False       # True while jog mode is active
+_last_sensor_terminal_width = 0
+_last_sensor_terminal_time = 0.0
+JOG_DISPLAY_DIR = 0
+JOG_TERMINAL_REFRESH_S = 0.05
+OFFSET_ADJUST_REFRESH_S = 0.05
+OFFSET_ADJUST_MAX_PENDING = 8
+LOG_TO_CONSOLE = False
+MIN_STEP_DELAY_MS = 1
+MAX_STEP_DELAY_MS = 1000
+JOG_SPEED_STEP_MS = 1
 
 # --- Logging & persistence paths ---
 LOG_DIR   = "logs"
 LOG_FILE  = os.path.join(LOG_DIR, "stepper.log")  # single, ever-growing log
 STATE_DIR = "state"
 STEP_FILE = os.path.join(STATE_DIR, "step_count.txt")  # holds only the step_count number
+JOG_SPEED_FILE = os.path.join(STATE_DIR, "jog_speed_ms.txt")
 
 #optical-home offset persistence
 OPTICAL_OFFSET_FILE = os.path.join(STATE_DIR, "optical_home_offset.txt")
@@ -204,8 +262,22 @@ OPTICAL_HOME_OFFSET_STEPS = 0  # +CW, -CCW (relative to Disk Home)
 # Grating geometry
 GRATING_D_MM = 1.0 / 1200.0   # groove spacing in mm for 1200 lines/mm
 
+
+# Half-step drive sequence. Each row is one electrical half-step.
+seq = [
+    [1,0,0,1],
+    [1,0,0,0],
+    [1,1,0,0],
+    [0,1,0,0],
+    [0,1,1,0],
+    [0,0,1,0],
+    [0,0,1,1],
+    [0,0,0,1],
+]
+_seq_index = 0
+
 # S2 rotation calibration storage
-S2_STEPS_PER_REV = 18000  # measured later; fallback computed if missing
+S2_STEPS_PER_REV = 18000 * len(seq)  # legacy controller counted 1 "step" per full sequence cycle
 STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0     # derived (S2_STEPS_PER_REV / 360)
 
 # Fallback (from your notes: 205 revs + 40 steps for one S2 360°)
@@ -230,41 +302,64 @@ except Exception:
 # One live calibration instance (loaded on startup)
 _cal = None
 
-# Define your step sequence
-seq = [
-    [1,0,0,1],
-    [1,0,0,0],
-    [1,1,0,0],
-    [0,1,0,0],
-    [0,1,1,0],
-    [0,0,1,0],
-    [0,0,1,1],
-    [0,0,0,1],
-    [1,0,0,1]
-]
-
-#attempt to running smoother stepper, 
-seq2 = [
-    [1,0,0,1],
-    [1,0,0,0],
-    [1,1,0,0],
-    [0,1,0,0],
-    [0,1,1,0],
-    [0,0,1,0],
-    [0,0,1,1],
-    [0,0,0,1],
-]
 
 step_delay = 0.001  # 01ms (adjust for your setup)
 steps_per_move = 512  # number of steps per move (adjust as needed)
 
-def jog_mode2(step_delay):
+def _delay_to_ms(delay_s):
+    return int(round(float(delay_s) * 1000.0))
+
+def _clamp_step_delay_ms(ms):
+    return max(MIN_STEP_DELAY_MS, min(MAX_STEP_DELAY_MS, int(round(float(ms)))))
+
+def _persist_jog_speed():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = JOG_SPEED_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(_delay_to_ms(step_delay)))
+    os.replace(tmp, JOG_SPEED_FILE)
+
+def _set_step_delay_ms(ms, *, persist=True):
+    global step_delay
+    step_delay = _clamp_step_delay_ms(ms) / 1000.0
+    if persist:
+        _persist_jog_speed()
+    return step_delay
+
+def _load_persisted_jog_speed():
+    global step_delay
+    try:
+        with open(JOG_SPEED_FILE, "r") as f:
+            ms = _clamp_step_delay_ms(int(f.read().strip()))
+            step_delay = ms / 1000.0
+            print(f"[Persist] Jog speed = {ms} ms/step (from {JOG_SPEED_FILE})")
+    except FileNotFoundError:
+        print(f"[Persist] No jog-speed file; defaulting to {_delay_to_ms(step_delay)} ms/step")
+    except Exception as e:
+        print(f"[Persist] Could not read {JOG_SPEED_FILE} ({e}); using {_delay_to_ms(step_delay)} ms/step")
+
+def jog_mode2():
+    global JOG_STREAM_SENSORS, JOG_DISPLAY_DIR, step_delay
     print("\n--- Jog Mode ---")
     print("Hold UP for forward, DOWN for reverse. Press Q to quit jog mode.")
+    print("RIGHT arrow speeds up by 1 ms/step. LEFT arrow slows down by 1 ms/step.")
+    print("[Jog] Manual jog uses exact steps only; backlash compensation is disabled here.")
+    JOG_STREAM_SENSORS = True
+    JOG_DISPLAY_DIR = 0
 
     running = True
     forward_pressed = False
     reverse_pressed = False
+    speed_adjust_queue = deque()
+    speed_keys_held = set()
+
+    def _apply_speed_delta(delta_ms):
+        old_ms = _delay_to_ms(step_delay)
+        _set_step_delay_ms(old_ms + delta_ms, persist=True)
+        new_ms = _delay_to_ms(step_delay)
+        if new_ms != old_ms:
+            _clear_sensor_terminal_line()
+            print(f"[Jog] Speed set to {new_ms} ms/step.")
 
     def on_press(key):
         nonlocal running, forward_pressed, reverse_pressed
@@ -272,8 +367,17 @@ def jog_mode2(step_delay):
             forward_pressed = True
         elif key == pynput_keyboard.Key.down:
             reverse_pressed = True
+        elif key == pynput_keyboard.Key.right:
+            if key not in speed_keys_held:
+                speed_keys_held.add(key)
+                speed_adjust_queue.append(-JOG_SPEED_STEP_MS)
+        elif key == pynput_keyboard.Key.left:
+            if key not in speed_keys_held:
+                speed_keys_held.add(key)
+                speed_adjust_queue.append(+JOG_SPEED_STEP_MS)
         elif hasattr(key, 'char') and key.char and key.char.lower() == 'q':
             running = False
+            _clear_sensor_terminal_line()
             print("Exiting jog mode.")
             print("step count", step_count)
             print("rev count", rev_count)
@@ -285,29 +389,45 @@ def jog_mode2(step_delay):
             forward_pressed = False
         elif key == pynput_keyboard.Key.down:
             reverse_pressed = False
+        elif key in (pynput_keyboard.Key.left, pynput_keyboard.Key.right):
+            speed_keys_held.discard(key)
 
     listener = None
     try:
-        listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener = _make_keyboard_listener(on_press=on_press, on_release=on_release)
         listener.start()
         while running:
-            #step_delay = 0.001  # responsive fixed delay
+            JOG_DISPLAY_DIR = 0
+            while speed_adjust_queue:
+                _apply_speed_delta(speed_adjust_queue.popleft())
             if forward_pressed:
-                move_biased(steps=1, step_delay=step_delay, direction=1)
+                JOG_DISPLAY_DIR = +1
+                move_exact(steps=1, step_delay=step_delay, direction=1)
                 while forward_pressed and running:
-                    move_biased(steps=1, step_delay=step_delay, direction=1)
+                    JOG_DISPLAY_DIR = +1
+                    while speed_adjust_queue:
+                        _apply_speed_delta(speed_adjust_queue.popleft())
+                    move_exact(steps=1, step_delay=step_delay, direction=1)
 
             if reverse_pressed:
-                move_biased(steps=1, step_delay=step_delay, direction=-1)
+                JOG_DISPLAY_DIR = -1
+                move_exact(steps=1, step_delay=step_delay, direction=-1)
                 while reverse_pressed and running:
-                    move_biased(steps=1, step_delay=step_delay, direction=-1)
+                    JOG_DISPLAY_DIR = -1
+                    while speed_adjust_queue:
+                        _apply_speed_delta(speed_adjust_queue.popleft())
+                    move_exact(steps=1, step_delay=step_delay, direction=-1)
 
-            monitor_sensors()
+            monitor_sensors(reason="jog")
             time.sleep(0.01)
     finally:
+        JOG_STREAM_SENSORS = False
+        JOG_DISPLAY_DIR = 0
+        _clear_sensor_terminal_line()
         if listener:
             listener.stop()
             listener.join(timeout=0.2)
+        settle_terminal_input()
 
 
 def _start_cancel_listener(hint="Press 'q' or Esc to cancel and return to the main menu."):
@@ -323,18 +443,17 @@ def _start_cancel_listener(hint="Press 'q' or Esc to cancel and return to the ma
         except Exception:
             pass
 
-    listener = pynput_keyboard.Listener(on_press=on_press)
+    listener = _make_keyboard_listener(on_press=on_press)
     listener.start()
     return listener
 
 
 def wavelength_to_theta_deg(lambda_nm, order_m, d_mm=GRATING_D_MM):
     """
-    Uses your relation: m * λ = d * sin(theta)
+    Ideal Littrow relation: m * λ = 2 * d * sin(theta)
     λ enters in nm; convert to mm. Returns theta in degrees.
     """
     lam_mm = lambda_nm * 1e-6  # 1 nm = 1e-6 mm
-    #arg = (order_m * lam_mm) / d_mm.    # non littrow
     arg = (order_m * lam_mm) / (2*d_mm)  # for Littrow
     if abs(arg) > 1.0:
         raise ValueError(f"Unreachable angle: |m*λ/d| = {arg:.6f} > 1")
@@ -377,27 +496,188 @@ def _fit_littrow_linear(points):
     a = (sumy - b*sumx) / n
     return a, b
 
+def _fit_littrow_through_origin(points):
+    """
+    Fit λ/m ≈ b * (2d sinθ)_nm.
+    Returns (a, b) with a fixed to 0.
+    """
+    X, Y = [], []
+    for p in points:
+        m = float(p["order_m"])
+        if m == 0:
+            continue
+        X.append(_deg_to_littrow_term(p["theta_deg"]))
+        Y.append(p["lambda_nm"] / m)
+    if len(X) < 1:
+        raise ValueError("Need at least one nonzero-order reference for a through-origin fit.")
+    sumxx = sum(x*x for x in X)
+    sumxy = sum(x*y for x, y in zip(X, Y))
+    if abs(sumxx) < 1e-12:
+        raise ValueError("Degenerate through-origin fit (sumxx≈0).")
+    return 0.0, (sumxy / sumxx)
+
+def _fit_sin_cos_model(points):
+    """
+    Fit λ/m ≈ A*sinθ + B*cosθ.
+    Returns (A_nm, B_nm).
+    """
+    s2 = c2 = sc = sy = cy = 0.0
+    used = 0
+    for p in points:
+        m = float(p["order_m"])
+        if m == 0:
+            continue
+        theta_rad = math.radians(float(p["theta_deg"]))
+        sval = math.sin(theta_rad)
+        cval = math.cos(theta_rad)
+        yval = float(p["lambda_nm"]) / m
+        s2 += sval * sval
+        c2 += cval * cval
+        sc += sval * cval
+        sy += sval * yval
+        cy += cval * yval
+        used += 1
+    if used < 2:
+        raise ValueError("Need at least two nonzero-order references to fit a sine/cosine model.")
+    denom = s2 * c2 - sc * sc
+    if abs(denom) < 1e-12:
+        raise ValueError("Degenerate sine/cosine fit (denominator≈0).")
+    sin_coeff = (sy * c2 - cy * sc) / denom
+    cos_coeff = (cy * s2 - sy * sc) / denom
+    return sin_coeff, cos_coeff
+
+def _normalize_wl_model(model):
+    if not isinstance(model, dict):
+        return {"kind": "affine_littrow", "a": 0.0, "b": 1.0}
+
+    kind = model.get("kind")
+    if not kind:
+        if "sin_coeff_nm" in model or "cos_coeff_nm" in model:
+            kind = "sin_cos"
+        elif "amplitude_nm" in model or "theta0_deg" in model:
+            kind = "sin_theta_offset"
+        else:
+            kind = "affine_littrow"
+
+    if kind == "affine_littrow":
+        return {
+            "kind": kind,
+            "a": float(model.get("a", 0.0)),
+            "b": float(model.get("b", 1.0)),
+        }
+
+    if kind == "sin_theta_offset":
+        return {
+            "kind": kind,
+            "amplitude_nm": float(model.get("amplitude_nm", 0.0)),
+            "theta0_deg": float(model.get("theta0_deg", 0.0)),
+        }
+
+    if kind == "sin_cos":
+        sin_coeff = float(model.get("sin_coeff_nm", model.get("A", 0.0)))
+        cos_coeff = float(model.get("cos_coeff_nm", model.get("B", 0.0)))
+        amplitude_nm = math.hypot(sin_coeff, cos_coeff)
+        phase_deg = math.degrees(math.atan2(cos_coeff, sin_coeff)) if amplitude_nm else 0.0
+        return {
+            "kind": kind,
+            "sin_coeff_nm": sin_coeff,
+            "cos_coeff_nm": cos_coeff,
+            "amplitude_nm": amplitude_nm,
+            "phase_deg": phase_deg,
+        }
+
+    return {"kind": "affine_littrow", "a": 0.0, "b": 1.0}
+
+def _wl_model_value(theta_deg, model):
+    """
+    Evaluate λ/m in nm at the supplied θ, using the saved model family.
+    """
+    model = _normalize_wl_model(model)
+    theta_rad = math.radians(theta_deg)
+
+    if model["kind"] == "affine_littrow":
+        return model["a"] + model["b"] * _deg_to_littrow_term(theta_deg)
+    if model["kind"] == "sin_theta_offset":
+        return model["amplitude_nm"] * math.sin(theta_rad + math.radians(model["theta0_deg"]))
+    if model["kind"] == "sin_cos":
+        return (
+            model["sin_coeff_nm"] * math.sin(theta_rad)
+            + model["cos_coeff_nm"] * math.cos(theta_rad)
+        )
+    raise ValueError(f"Unknown wavelength model kind: {model['kind']}")
+
+def _wl_model_summary(model):
+    model = _normalize_wl_model(model)
+    if model["kind"] == "affine_littrow":
+        return (
+            "affine Littrow: "
+            f"λ/m ≈ {model['a']:.6f} + {model['b']:.6f}·(2d sinθ)_nm"
+        )
+    if model["kind"] == "sin_theta_offset":
+        return (
+            "phase-shift sine: "
+            f"λ/m ≈ {model['amplitude_nm']:.6f}·sin(θ + {model['theta0_deg']:.6f}°)"
+        )
+    if model["kind"] == "sin_cos":
+        return (
+            "sine/cosine: "
+            f"λ/m ≈ {model['sin_coeff_nm']:.6f}·sinθ + {model['cos_coeff_nm']:.6f}·cosθ"
+        )
+    return "unknown wavelength model"
+
+def _wl_model_residuals(points, model):
+    res = []
+    for p in points:
+        mref = float(p["order_m"])
+        if mref == 0:
+            continue
+        y = float(p["lambda_nm"]) / mref
+        yhat = _wl_model_value(float(p["theta_deg"]), model)
+        res.append(y - yhat)
+    return res
+
 
 def _theta_deg_from_lambda(lambda_nm, order_m):
     """
-    Use saved WL model (a, b) if available; otherwise fall back to ideal Littrow (a=0,b=1).
-    Model: λ/m ≈ a + b * X, where X = (2d sinθ) in nm.
-    Solve for θ: sinθ = ((λ/m - a) / (b * 2d_mm * 1e6)).
+    Use the saved wavelength model if available; otherwise fall back to ideal Littrow.
+    Supported models:
+      - affine Littrow: λ/m ≈ a + b·(2d sinθ)_nm
+      - phase-shift sine: λ/m ≈ A·sin(θ + θ0)
+      - sine/cosine: λ/m ≈ A·sinθ + B·cosθ
     """
-    # Always load fresh from the WL store
     WL = _wl_load(STATE_DIR)
-    model = WL.get("model") or {}
-    a = float(model.get("a", 0.0))
-    b = float(model.get("b", 1.0))
+    model = _normalize_wl_model(WL.get("model"))
+    target = lambda_nm / float(order_m)
 
-    target = (lambda_nm / float(order_m)) - a
-    denom = b * (2.0 * GRATING_D_MM * 1e6)  # b * (2d)_nm
-    if abs(denom) < 1e-12:
-        raise ValueError("Invalid wavelength model (b near zero).")
-    arg = target / denom
-    if abs(arg) > 1.0:
-        raise ValueError(f"Requested λ={lambda_nm} nm, m={order_m} not reachable (|sinθ|={arg:.6f}>1).")
-    return math.degrees(math.asin(arg))
+    if model["kind"] == "affine_littrow":
+        target -= model["a"]
+        denom = model["b"] * (2.0 * GRATING_D_MM * 1e6)
+        if abs(denom) < 1e-12:
+            raise ValueError("Invalid wavelength model (b near zero).")
+        arg = target / denom
+        if abs(arg) > 1.0:
+            raise ValueError(f"Requested λ={lambda_nm} nm, m={order_m} not reachable (|sinθ|={arg:.6f}>1).")
+        return math.degrees(math.asin(arg))
+
+    if model["kind"] == "sin_theta_offset":
+        amplitude = model["amplitude_nm"]
+        if abs(amplitude) < 1e-12:
+            raise ValueError("Invalid wavelength model (amplitude near zero).")
+        arg = target / amplitude
+        if abs(arg) > 1.0:
+            raise ValueError(f"Requested λ={lambda_nm} nm, m={order_m} not reachable (|sinθ|={arg:.6f}>1).")
+        return math.degrees(math.asin(arg)) - model["theta0_deg"]
+
+    if model["kind"] == "sin_cos":
+        amplitude = model["amplitude_nm"]
+        if abs(amplitude) < 1e-12:
+            raise ValueError("Invalid wavelength model (amplitude near zero).")
+        arg = target / amplitude
+        if abs(arg) > 1.0:
+            raise ValueError(f"Requested λ={lambda_nm} nm, m={order_m} not reachable (|sinθ|={arg:.6f}>1).")
+        return math.degrees(math.asin(arg)) - model["phase_deg"]
+
+    raise ValueError(f"Unknown wavelength model kind: {model['kind']}")
 
 
 
@@ -439,7 +719,7 @@ def calibrate_s2_steps_per_rev(approach_dir=+1):
     return S2_STEPS_PER_REV
 
 
-FAR_STEP_THRESHOLD_MOVE = 600   # if farther than this, sprint at FAST_STEP_DELAY
+FAR_STEP_THRESHOLD_MOVE = _legacy_steps(600)   # if farther than this, sprint at FAST_STEP_DELAY
 
 
 # cancellimng functions
@@ -456,9 +736,12 @@ def _check_cancel():
 
 def _stop_cancel_listener(listener):
     try:
-        if listener: listener.stop()
+        if listener:
+            listener.stop()
+            listener.join(timeout=0.2)
     finally:
         _set_cancel(False)
+        settle_terminal_input()
 
 def _run_cancellable(fn, *args, **kwargs):
     """
@@ -484,6 +767,90 @@ def _ensure_steps_per_deg():
         STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0
         print(f"[Warn] Using fallback S2_STEPS_PER_REV={S2_STEPS_PER_REV} -> STEPS_PER_DEG={STEPS_PER_DEG:.6f}")
 
+def _upgrade_legacy_calibration_units():
+    global steps_per_rev, S2_STEPS_PER_REV, STEPS_PER_DEG, BACKLASH_STEPS, EDGE_HOLDOFF_STEPS
+
+    legacy = False
+    if steps_per_rev not in (None, 0) and steps_per_rev < 200:
+        legacy = True
+    if S2_STEPS_PER_REV not in (None, 0) and S2_STEPS_PER_REV < 50000:
+        legacy = True
+    if STEPS_PER_DEG not in (None, 0) and STEPS_PER_DEG < 100:
+        legacy = True
+
+    if not legacy:
+        return False
+
+    notes = []
+    if steps_per_rev not in (None, 0) and steps_per_rev < 200:
+        steps_per_rev = int(round(steps_per_rev * LEGACY_STEP_SCALE))
+        notes.append(f"S1 steps/rev -> {steps_per_rev}")
+    if S2_STEPS_PER_REV not in (None, 0) and S2_STEPS_PER_REV < 50000:
+        S2_STEPS_PER_REV = int(round(S2_STEPS_PER_REV * LEGACY_STEP_SCALE))
+        notes.append(f"S2 steps/rev -> {S2_STEPS_PER_REV}")
+    if STEPS_PER_DEG not in (None, 0) and STEPS_PER_DEG < 100:
+        STEPS_PER_DEG = float(STEPS_PER_DEG * LEGACY_STEP_SCALE)
+        notes.append(f"steps/deg -> {STEPS_PER_DEG:.6f}")
+    if BACKLASH_STEPS not in (None, 0):
+        BACKLASH_STEPS = int(round(BACKLASH_STEPS * LEGACY_STEP_SCALE))
+        notes.append(f"backlash -> {BACKLASH_STEPS}")
+    if EDGE_HOLDOFF_STEPS not in (None, 0) and EDGE_HOLDOFF_STEPS < _legacy_steps(3):
+        EDGE_HOLDOFF_STEPS = int(round(EDGE_HOLDOFF_STEPS * LEGACY_STEP_SCALE))
+        notes.append(f"edge_holdoff -> {EDGE_HOLDOFF_STEPS}")
+
+    print("[Cal] Upgraded legacy calibration values to half-step units:")
+    for note in notes:
+        print(f"  - {note}")
+    print("[Cal] Re-run S1, S2, backlash, and optical-home calibration when convenient.")
+    return True
+
+def _steps_to_theta_deg(abs_steps):
+    _ensure_steps_per_deg()
+    return (float(abs_steps) - OPTICAL_HOME_OFFSET_STEPS) / STEPS_PER_DEG
+
+def _wrap_delta_steps(delta_steps):
+    _ensure_steps_per_deg()
+    rev = int(round(S2_STEPS_PER_REV)) if S2_STEPS_PER_REV else 0
+    delta = int(round(delta_steps))
+    if rev <= 0:
+        return delta
+    half = rev / 2.0
+    while delta > half:
+        delta -= rev
+    while delta < -half:
+        delta += rev
+    return delta
+
+def _final_approach_backoff_steps():
+    return max(int(FIXED_FINAL_APPROACH_BACKOFF_STEPS), int(BACKLASH_STEPS or 0) + 4)
+
+def _move_to_target_steps_fixed_approach(target_steps, final_dir=FIXED_FINAL_APPROACH_DIR):
+    """
+    Reach the target by the shorter route while making the last segment arrive
+    in a consistent direction. This reduces S2 backlash sensitivity in "shortest" mode.
+    """
+    target_steps = int(round(target_steps))
+    current = step_count
+    direct_delta = _wrap_delta_steps(target_steps - current)
+    if direct_delta == 0:
+        return
+
+    if (1 if direct_delta > 0 else -1) == final_dir:
+        _stage_move_signed(direct_delta)
+        return
+
+    pretarget = target_steps - final_dir * _final_approach_backoff_steps()
+    pre_delta = _wrap_delta_steps(pretarget - current)
+    if pre_delta != 0:
+        _stage_move_signed(pre_delta)
+
+    final_delta = _wrap_delta_steps(target_steps - step_count)
+    if final_delta == 0:
+        return
+    if (1 if final_delta > 0 else -1) != final_dir and S2_STEPS_PER_REV:
+        final_delta += final_dir * int(round(S2_STEPS_PER_REV))
+    _stage_move_signed(final_delta)
+
 def angle_to_steps(theta_deg):
     _ensure_steps_per_deg()
     direction = 1 #if CW is positive and -1 if CW is negative
@@ -504,41 +871,27 @@ def move_to_angle_deg(theta_deg, mode="from_home_ccw"):
       - `OPTICAL_HOME_OFFSET_STEPS` is always included in the target, so θ=0 refers
         to your *optical home* (Disk Home + offset), not raw Disk Home.
       - For better repeatability, the final approach is forced to the same direction
-        (see FINAL_APPROACH_DIR / FINAL_APPROACH_BACKOFF).
+        in `shortest` mode (see `FIXED_FINAL_APPROACH_DIR` / `FIXED_FINAL_APPROACH_BACKOFF_STEPS`).
     """
     _ensure_steps_per_deg()
     target_steps = _target_steps_from_disk_home(theta_deg)  # includes OPTICAL_HOME_OFFSET_STEPS
 
     if mode == "from_home_ccw":
         # Always begin from a known reference
-        go_home2()  # zeros step_count at Disk Home
+        if not go_home2():
+            print("[Home] Could not establish Disk Home; move aborted.")
+            return
         #_approach_abs_steps(target_steps, mode="from_home_ccw")
         _stage_move_signed(target_steps)  
 
     elif mode == "shortest":
-        # Move from current position, but still land with a consistent final approach direction
-        #_approach_abs_steps(target_steps, mode="shortest")
-        # Compare current Disk-Home-referenced position to Disk-Home-referenced target
-        current = step_count
-        delta = target_steps - current
-
-        # Take the shorter wrap if that’s allowed
-        _ensure_steps_per_deg()
-        if abs(delta) > S2_STEPS_PER_REV / 2:
-            if delta > 0:
-                delta -= S2_STEPS_PER_REV
-            else:
-                delta += S2_STEPS_PER_REV
-
-        _stage_move_signed(delta)
+        _move_to_target_steps_fixed_approach(target_steps)
 
     else:
         raise ValueError("mode must be 'from_home_ccw' or 'shortest'")
 
 
-#trying litrow with m*lambda = d*(sin(alpha)-sin(beta))
 def move_to_wavelength_nonlinear(lambda_nm, order_m, mode="from_home_ccw"):
-    # θ from model if present; otherwise ideal Littrow
     try:
         theta = _theta_deg_from_lambda(lambda_nm, order_m)
     except ValueError as e:
@@ -547,7 +900,7 @@ def move_to_wavelength_nonlinear(lambda_nm, order_m, mode="from_home_ccw"):
     print(f"Target θ = {theta:.4f}° for λ={lambda_nm} nm, m={order_m}")
     move_to_angle_deg(theta, mode=mode)
 
-#linear litrow fit with m*lambda = d*sin(theta), where theta is the grating angle. 
+# ideal Littrow with no fitted correction
 def move_to_wavelength(lambda_nm, order_m, mode="from_home_ccw"):
     theta = wavelength_to_theta_deg(lambda_nm, order_m)
     print(f"Target θ = {theta:.4f}° for λ={lambda_nm} nm, m={order_m}")
@@ -566,7 +919,7 @@ def estimate_steps_from_S1():
     # Here I mirror your sign usage.
     return rev_count * steps_per_rev + steps_since_rev - pre_rev_steps
 
-def check_step_integrity(tolerance_steps=4):
+def check_step_integrity(tolerance_steps=_legacy_steps(4)):
     est = estimate_steps_from_S1()
     err = est - step_count
     if abs(err) > tolerance_steps:
@@ -583,88 +936,95 @@ def move_biased(steps, step_delay, direction):
 
     # If direction changes, take up backlash in the new direction first.
     if _last_move_dir is not None and direction != _last_move_dir:
+        _persist_step_count()
         if BACKLASH_STEPS > 0:
-            # Take up slack. These are "compensation" steps; you can treat them
-            # as physical-only, but since your counters track actual motion,
-            # letting them count is fine.
-            move_stepper(seq, BACKLASH_STEPS, step_delay, direction)
+            # Take up slack physically, but do not advance the logical stage coordinate.
+            move_stepper(seq, BACKLASH_STEPS, step_delay, direction, count_logical_steps=False)
 
-    adj_steps = steps
+    extra_reverse_steps = 0
     if direction == -1 and DIR_REVERSE_SCALE != 1.0:
-        # accumulate only the *extra* steps from scaling
+        # Accumulate only the *extra* physical steps needed for reverse compensation.
+        # These should not advance the logical stage coordinate.
         _rev_scale_err_accum += steps * (DIR_REVERSE_SCALE - 1.0)
         extra = int(round(_rev_scale_err_accum))
         _rev_scale_err_accum -= extra
-        adj_steps = steps + max(0, extra)
+        extra_reverse_steps = max(0, extra)
 
-    if adj_steps > 0:
-        move_stepper(seq, adj_steps, step_delay, direction)
+    if steps > 0:
+        move_stepper(seq, steps, step_delay, direction, count_logical_steps=True)
+    if extra_reverse_steps > 0:
+        move_stepper(seq, extra_reverse_steps, step_delay, direction, count_logical_steps=False)
         
     _last_move_dir = direction
     _check_cancel() 
 
-def move_stepper(seq, steps,step_delay, direction):
+def move_exact(steps, step_delay, direction):
+    """Move literal stage steps with no backlash or reverse-scale compensation."""
+    global _last_move_dir
+    if steps <= 0:
+        return
+    move_stepper(seq, int(steps), step_delay, direction)
+    _last_move_dir = direction
+
+def move_stepper(seq, steps,step_delay, direction, count_logical_steps=True):
     global step_count, rev_count, last_switch1_state, last_switch2_state, transition_sequence, _steps_since_any_edge
     global home, switch1, switch2, steps_per_rev, steps_till_rev, steps_since_rev, is_1rev_completed
+    global _seq_index
     # do NOT reinitialize them here!
     # just update their values as you go
-
-    if direction == -1:
-        sequence = list(reversed(seq))
-    else: sequence = seq
-    
+    motor_direction = _motor_direction(direction)
 
     for _ in range(steps):
         _check_cancel()
-        for step in sequence:
-            for pin, val in zip(pins, step):
-                board.digital[pin].write(val)
-            monitor_sensors()
+        _seq_index = (_seq_index + (1 if motor_direction > 0 else -1)) % len(seq)
+        for pin, val in zip(pins, seq[_seq_index]):
+            board.digital[pin].write(val)
 
-             # Read switch 1 (smaller disk) state each time you move a step
-            switch1 = board.digital[optical_pin].read()
+        # One commanded step has physically happened.
+        if count_logical_steps:
+            step_count += 1 * direction
+            steps_since_rev += 1 * direction
+            _steps_since_any_edge += 1 if direction > 0 else -1
 
-            if switch1 is None:
-                state1 = "WAITING"
-            elif switch1:
-                state1 = "BLOCKED"
-            else:
-                state1 = "OPEN"
+        monitor_sensors()
 
-            if state1 == "OPEN":
-                is_1rev_completed = True
+         # Read switch 1 (smaller disk) state each time you move a half-step
+        switch1 = board.digital[optical_pin].read()
 
-            # Track transition sequence for open->blocked->open
-            if last_switch1_state is not None:
-                # Only add when state changes
-                if state1 != last_switch1_state:
-                    transition_sequence.append(state1)
-                    # Keep last three states only
-                    if len(transition_sequence) > 3:
-                        transition_sequence.pop(0)
+        if switch1 is None:
+            state1 = "WAITING"
+        elif switch1:
+            state1 = "BLOCKED"
+        else:
+            state1 = "OPEN"
 
-                    # Check for open->blocked->open
-                    #if transition_sequence == ["OPEN", "BLOCKED", "OPEN"]:
-                    if transition_sequence == ["OPEN", "BLOCKED", "OPEN"] and abs(_steps_since_any_edge) >= EDGE_HOLDOFF_STEPS:
-                         #if steps_since_rev > steps_per_rev * 0.8:  # Assuming at least 80% of expected steps before counting a rev
-                        rev_count += 1 * direction
-                        is_1rev_completed = True
-                        steps_since_rev = 0
-                        _steps_since_any_edge = 0
-                        transition_sequence = ["OPEN"] # reset for next revolution
+        if count_logical_steps and state1 == "OPEN":
+            is_1rev_completed = True
 
+        # Track transition sequence for open->blocked->open
+        if count_logical_steps and last_switch1_state is not None:
+            # Only add when state changes
+            if state1 != last_switch1_state:
+                transition_sequence.append(state1)
+                # Keep last three states only
+                if len(transition_sequence) > 3:
+                    transition_sequence.pop(0)
 
-            last_switch1_state = state1
-            time.sleep(step_delay)
-        
-        _steps_since_any_edge += 1 if direction > 0 else -1  # signed ok; we use abs()
-        step_count += 1*direction  # After one complete seq, count as one step
-        steps_since_rev += 1*direction
+                # Check for open->blocked->open
+                if transition_sequence == ["OPEN", "BLOCKED", "OPEN"] and abs(_steps_since_any_edge) >= EDGE_HOLDOFF_STEPS:
+                    rev_count += 1 * direction
+                    is_1rev_completed = True
+                    steps_since_rev = 0
+                    _steps_since_any_edge = 0
+                    transition_sequence = ["OPEN"] # reset for next revolution
 
-        #add persistence per step, remove if run time increases too much 
-        _persist_step_count()
+        last_switch1_state = state1
+        time.sleep(step_delay)
 
-        if is_1rev_completed == False and state1 == "BLOCKED":
+        if count_logical_steps:
+            _maybe_persist_step_count()
+
+        if count_logical_steps and is_1rev_completed == False and state1 == "BLOCKED":
             steps_till_rev += 1 *direction
 
     # Turn all pins off when done
@@ -672,13 +1032,12 @@ def move_stepper(seq, steps,step_delay, direction):
         board.digital[pin].write(0)
 
     # persist current position to disk
-    _persist_step_count()
+    if count_logical_steps:
+        _persist_step_count()
 
-    #for testing    
-    print("step count", step_count)
-    print("rev count", rev_count)
-
-def set_speed(current_delay):
+def set_speed(current_delay=None):
+    global step_delay
+    current_delay = step_delay if current_delay is None else current_delay
     print(f"Current speed: {int(current_delay*1000)} ms per step")
     print("Increasing ms/step results in slower rotation, with 1ms being fastest")
     while True:
@@ -686,14 +1045,13 @@ def set_speed(current_delay):
             val = input("Enter new speed in ms per step (e.g., 15), or ENTER to keep: ").strip()
             if val == '':
                 print("Keeping current speed.")
-                return current_delay
+                return step_delay
             ms = int(val)
-            if ms < 1 or ms > 1000:
-                print("Enter a value between 1 and 1000 ms.")
+            if ms < MIN_STEP_DELAY_MS or ms > MAX_STEP_DELAY_MS:
+                print(f"Enter a value between {MIN_STEP_DELAY_MS} and {MAX_STEP_DELAY_MS} ms.")
                 continue
-            new_delay = ms / 1000.0
             print(f"Speed set to {ms} ms per step.")
-            return new_delay
+            return _set_step_delay_ms(ms, persist=True)
         except ValueError:
             print("Invalid input. Enter a number.")
 
@@ -738,7 +1096,14 @@ def _measure_one_cycle_steps(pin, direction, step_delay=0.003, max_steps=100000)
     # If we somehow didn't complete a cycle, return what we counted.
     return steps
 
-def calibrate_directional_bias(pin=optical_pin, approach_dir=1, verbose=True):
+def _sensor_label(pin):
+    if pin == optical_pin2:
+        return "S2 (worm gear)"
+    if pin == optical_pin:
+        return "S1 (motor disk)"
+    return f"pin {pin}"
+
+def calibrate_directional_bias(pin=optical_pin2, approach_dir=1, verbose=True):
     """
     Measures:
       - FORWARD steady steps for 1 sensor cycle
@@ -749,6 +1114,8 @@ def calibrate_directional_bias(pin=optical_pin, approach_dir=1, verbose=True):
       DIR_REVERSE_SCALE = forward_steady / reverse_steady
     """
     global DIR_REVERSE_SCALE, BACKLASH_STEPS
+    label = _sensor_label(pin)
+    _log_calibration_event(f"Directional bias calibration started on {label} with approach_dir={approach_dir}")
 
     # Index to a consistent edge in forward direction
     _seek_open_edge(pin, approach_dir=approach_dir, step_delay=0.004)
@@ -773,7 +1140,7 @@ def calibrate_directional_bias(pin=optical_pin, approach_dir=1, verbose=True):
     DIR_REVERSE_SCALE = float(reverse_scale)
 
     if verbose:
-        print("=== Directional Bias Calibration ===")
+        print(f"=== Directional Bias Calibration: {label} ===")
         print(f"Forward steady rev steps:        {f_steps}")
         print(f"Reverse first rev (with backlash): {r_first}")
         print(f"Reverse steady rev steps:         {r_steady}")
@@ -803,6 +1170,10 @@ def calibrate_directional_bias(pin=optical_pin, approach_dir=1, verbose=True):
         reverse_scale=DIR_REVERSE_SCALE
     )
     print(f"[Cal] Backlash saved to: {path}")
+    _log_calibration_event(
+        f"{label}: forward={f_steps}, reverse_first={r_first}, reverse_steady={r_steady}, "
+        f"backlash={BACKLASH_STEPS}, reverse_scale={DIR_REVERSE_SCALE:.6f}"
+    )
     return out
 
 def calibration():
@@ -810,14 +1181,16 @@ def calibration():
     print("\n--- Calibration ---")
     print("Press 1 to calibrate the SMALL disk (optical switch 1).")
     print("Press 2 to calibrate the LARGE worm gear disk (optical switch 2).")
-    print("Press 3 to calibrate directional bias/backlash on SMALL disk (optical switch 1).")
+    print("Press 3 to calibrate directional bias/backlash on LARGE worm gear disk (optical switch 2).")
+    print("Press 4 to calibrate directional bias/backlash on SMALL disk (optical switch 1).")
     print("Press Q to quit back to main menu.")
 
     while True:
-        choice = input("Select calibration: 1 (small disk), 2 (large disk), Q (quit): ").strip().lower()
+        choice = input("Select calibration: 1 (small disk), 2 (large disk), 3 (S2 backlash), 4 (S1 backlash), Q (quit): ").strip().lower()
         if choice == '1':
             # --- Steps per rev FORWARD ---
             print("Calibrating steps per revolution (SMALL disk, FORWARD)...")
+            _log_calibration_event("S1 steps/rev calibration started")
             transition_sequence = ["OPEN"]
 
             time.sleep(3)
@@ -855,15 +1228,20 @@ def calibration():
             path = save_cal(STATE_DIR, s1_steps_per_rev=steps_per_rev)
 
             print(f"[Cal] S1 steps/rev saved to: {path}")
+            _log_calibration_event(f"S1 steps/rev calibration saved: steps_per_rev={steps_per_rev}")
         
             break
 
         elif choice == '2':
             print("Calibrating worm gear...")
+            _log_calibration_event("S2 steps/rev calibration started")
             # Move to home position first
             print("Homing worm gear (large disk) before calibration...please wait...")
             time.sleep(4)
-            go_home2()
+            if not go_home2():
+                print("[Cal S2] Could not establish Disk Home before calibration.")
+                _log_calibration_event("S2 steps/rev calibration aborted because homing failed")
+                return
             print("Big gear homed, begining calibration")
 
             last_switch2_state = "OPEN"
@@ -877,11 +1255,19 @@ def calibration():
 
             if steps is None:
                 print("[Cal S2] Failed to measure a full cycle. Check sensor and try again.")
+                _log_calibration_event("S2 steps/rev calibration failed to measure a full cycle")
                 return
             # (S2 calibration is already persisted by calibrate_s2_steps_per_rev)
-            go_home2()
+            _log_calibration_event(f"S2 steps/rev calibration saved: steps_per_rev={steps}")
+            if not go_home2():
+                print("[Cal S2] Calibration finished, but re-home failed afterward.")
+                _log_calibration_event("S2 calibration post-home failed")
 
         elif choice == '3':
+            print("Calibrating directional bias/backlash on large worm gear disk (sensor 2)...")
+            result = calibrate_directional_bias(pin=optical_pin2, approach_dir=+1, verbose=True)
+
+        elif choice == '4':
             print("Calibrating directional bias/backlash on small disk (sensor 1)...")
             result = calibrate_directional_bias(pin=optical_pin, approach_dir=+1, verbose=True)
 
@@ -891,7 +1277,7 @@ def calibration():
             return
 
         else:
-            print("Invalid input. Enter 1, 2, or Q.")
+            print("Invalid input. Enter 1, 2, 3, 4, or Q.")
 
     return
 
@@ -983,9 +1369,8 @@ def restore_wl_from_backup():
                         "model": model
                     }, out, indent=2, sort_keys=True)
 
-        a = model.get("a", 0.0) if isinstance(model, dict) else 0.0
-        b = model.get("b", 1.0) if isinstance(model, dict) else 1.0
-        print(f"[WL Cal] Restored {len(refs)} refs; model: a={a:.6f}, b={b:.6f} from {backup_path}")
+        print(f"[WL Cal] Restored {len(refs)} refs; model: {_wl_model_summary(model)} from {backup_path}")
+        _log_calibration_event(f"Wavelength backup restored: refs={len(refs)}, model={_wl_model_summary(model)}")
 
     except FileNotFoundError:
         print(f"[WL Cal] Backup not found: {backup_path}")
@@ -1003,10 +1388,13 @@ def wl_cal_menu():
         print("\n--- Wavelength Calibration ---")
         print("1) Add reference using CURRENT angle θ")
         print("2) Add reference by ENTERING angle θ")
-        print("3) Fit and save model (a,b)")
-        print("3z) Fit and save model with a=0 (through origin)")
+        print("3) Fit and save affine Littrow model")
+        print("3z) Fit and save affine Littrow model with a=0")
+        print("3s) Fit and save A·sin(θ + θ0) model")
+        print("3c) Fit and save A·sinθ + B·cosθ model")
         print("4) Show current references and model")
         print("5) Use Backup model")
+        print("6) ZWO-assisted line scan -> add reference")
         print("J) Jog Mode")
         print("x) Clear ALL wavelength refs and model (reset)")
         print("q) Back")
@@ -1020,11 +1408,13 @@ def wl_cal_menu():
                 print("Invalid λ or m.")
                 continue
 
-            _ensure_steps_per_deg()
-            theta_now = (step_count - OPTICAL_HOME_OFFSET_STEPS) / STEPS_PER_DEG
+            theta_now = _steps_to_theta_deg(step_count)
             refs.append({"theta_deg": float(theta_now), "lambda_nm": lam, "order_m": int(m)})
             _wl_save(STATE_DIR, refs, model)
             print(f"[WL Cal] Added ref: θ={theta_now:.6f}°, λ={lam} nm, m={m}")
+            _log_calibration_event(
+                f"Wavelength ref added from current angle: theta={theta_now:.6f} deg, lambda={lam} nm, order={m}"
+            )
 
         elif ch == "2":
             try:
@@ -1037,60 +1427,43 @@ def wl_cal_menu():
             refs.append({"theta_deg": float(theta), "lambda_nm": lam, "order_m": int(m)})
             _wl_save(STATE_DIR, refs, model)
             print(f"[WL Cal] Added ref: θ={theta:.6f}°, λ={lam} nm, m={m}")
+            _log_calibration_event(
+                f"Wavelength ref added by entry: theta={theta:.6f} deg, lambda={lam} nm, order={m}"
+            )
 
-        elif ch == "3" or ch == "3z":
+        elif ch in ("3", "3z", "3s", "3c"):
             try:
-                # Build X = (2d sinθ)_nm and Y = λ/m, skipping m=0
-                X, Y = [], []
-                for p in refs:
-                    m = float(p["order_m"])
-                    if m == 0:
-                        continue
-                    x_nm = _deg_to_littrow_term(float(p["theta_deg"]))  # already returns in nm
-                    X.append(x_nm)
-                    Y.append(float(p["lambda_nm"]) / m)
-
-                if len(X) < 2 and ch == "3":
-                    raise ValueError("Need at least two refs with m≠0 for a free (a,b) fit.")
-                if len(X) < 1 and ch == "3z":
-                    raise ValueError("Need at least one ref with m≠0 for a through-origin fit.")
-
                 if ch == "3z":
-                    # Through-origin: minimize sum (Y - bX)^2 -> b = sum(XY)/sum(XX)
-                    sumxx = sum(x*x for x in X)
-                    sumxy = sum(x*y for x, y in zip(X, Y))
-                    if abs(sumxx) < 1e-12:
-                        raise ValueError("Degenerate through-origin fit (sumxx≈0).")
-                    a = 0.0
-                    b = sumxy / sumxx
+                    a, b = _fit_littrow_through_origin(refs)
+                    model = {"kind": "affine_littrow", "a": float(a), "b": float(b)}
+                elif ch == "3":
+                    a, b = _fit_littrow_linear(refs)
+                    model = {"kind": "affine_littrow", "a": float(a), "b": float(b)}
+                elif ch == "3s":
+                    sin_coeff, cos_coeff = _fit_sin_cos_model(refs)
+                    amplitude_nm = math.hypot(sin_coeff, cos_coeff)
+                    theta0_deg = math.degrees(math.atan2(cos_coeff, sin_coeff)) if amplitude_nm else 0.0
+                    model = {
+                        "kind": "sin_theta_offset",
+                        "amplitude_nm": float(amplitude_nm),
+                        "theta0_deg": float(theta0_deg),
+                    }
                 else:
-                    # Regular linear fit y = a + bX
-                    n = len(X)
-                    sumx = sum(X); sumy = sum(Y)
-                    sumxx = sum(x*x for x in X)
-                    sumxy = sum(x*y for x, y in zip(X, Y))
-                    denom = n*sumxx - sumx*sumx
-                    if abs(denom) < 1e-9:
-                        raise ValueError("Degenerate fit (denominator≈0).")
-                    b = (n*sumxy - sumx*sumy) / denom
-                    a = (sumy - b*sumx) / n
+                    sin_coeff, cos_coeff = _fit_sin_cos_model(refs)
+                    model = {
+                        "kind": "sin_cos",
+                        "sin_coeff_nm": float(sin_coeff),
+                        "cos_coeff_nm": float(cos_coeff),
+                    }
 
-                model = {"a": float(a), "b": float(b)}
+                model = _normalize_wl_model(model)
                 _wl_save(STATE_DIR, refs, model)
-                print(f"[WL Cal] Fit saved. a={a:.6f}, b={b:.6f}   (λ/m ≈ a + b·(2d sinθ)_nm)")
+                print(f"[WL Cal] Fit saved. {_wl_model_summary(model)}")
+                _log_calibration_event(f"Wavelength model fit saved: {_wl_model_summary(model)}")
 
                 # --- Fit quality report ---
                 try:
-                    # residuals in (λ/m) space, computed on your refs
-                    res = []
-                    for p in refs:
-                        mref = float(p["order_m"])
-                        if mref == 0:
-                            continue
-                        x_nm = _deg_to_littrow_term(float(p["theta_deg"]))
-                        y = float(p["lambda_nm"]) / mref
-                        yhat = a + b * x_nm
-                        res.append(y - yhat)
+                    res = _wl_model_residuals(refs, model)
                     if res:
                         rms = (sum(r*r for r in res) / len(res)) ** 0.5
                         mx = max(abs(r) for r in res)
@@ -1117,21 +1490,32 @@ def wl_cal_menu():
             else:
                 for i, r in enumerate(refs):
                     print(f"  {i+1}: θ={r['theta_deg']:.6f}°, λ={r['lambda_nm']} nm, m={r['order_m']}")
-            if model:
-                print(f"Model: λ/m ≈ {model.get('a',0):.6f} + {model.get('b',1):.6f}·(2d sinθ)_nm")
+            if model is not None:
+                print(f"Model: {_wl_model_summary(model)}")
+                res = _wl_model_residuals(refs, model)
+                if res:
+                    rms = (sum(r*r for r in res) / len(res)) ** 0.5
+                    mx = max(abs(r) for r in res)
+                    print(f"Residuals on λ/m: RMS={rms:.6f} nm, max={mx:.6f} nm")
             else:
-                print("Model: (none) — ideal Littrow fallback (a=0, b=1)")
+                print("Model: (none) — ideal Littrow fallback (affine Littrow, a=0, b=1)")
 
         elif ch == "5":
             # Load backup model from cal_store if available
             try:
                 restore_wl_from_backup()
+                _log_calibration_event("Wavelength model restored from backup")
             except Exception as e:
                 print(f"[WL Cal] Could not load backup model: {e}")
 
+        elif ch == "6":
+            print("Launching ZWO-assisted line scan... (press 'q' or Esc to cancel)")
+            _log_calibration_event("Starting ZWO-assisted wavelength reference capture")
+            _run_cancellable(zwo_assisted_reference_capture)
+
         elif ch == "j":
             drain_stdin()
-            jog_mode2(step_delay=0.005)
+            jog_mode2()
             drain_stdin()
 
         elif ch == "x":
@@ -1145,6 +1529,7 @@ def wl_cal_menu():
             model = None
             _wl_save(STATE_DIR, refs, model)
             print("[WL Cal] Cleared refs and model (wavelength_cal.json).")
+            _log_calibration_event("Cleared all wavelength references and model")
 
             # Also nuke legacy fields in _cal so they can't re-populate the UI
             try:
@@ -1160,25 +1545,425 @@ def wl_cal_menu():
             print("Invalid option.")
 
 
-def monitor_sensors():
-    global step_count, rev_count, switch1, switch2, last_states, home 
-    
+def _parse_roi(roi_text):
+    parts = [p.strip() for p in roi_text.split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError("ROI must be x,y,w,h")
+    x, y, w, h = (int(p) for p in parts)
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        raise ValueError("ROI values must be non-negative and width/height must be > 0")
+    return x, y, w, h
+
+def _quadratic_peak_center(xs, ys):
+    if len(xs) != len(ys) or not xs:
+        raise ValueError("Need matching, non-empty x/y samples.")
+    idx = max(range(len(ys)), key=lambda i: ys[i])
+    x_peak = float(xs[idx])
+    if 0 < idx < len(ys) - 1:
+        y1, y2, y3 = ys[idx - 1], ys[idx], ys[idx + 1]
+        denom = y1 - 2.0 * y2 + y3
+        if abs(denom) > 1e-12:
+            dx = float(xs[idx] - xs[idx - 1])
+            offset = 0.5 * (y1 - y3) / denom * dx
+            if abs(offset) <= abs(dx):
+                x_peak = float(xs[idx]) + offset
+    return x_peak, idx
+
+def _load_numpy():
+    try:
+        import numpy as np
+        return np
+    except Exception as e:
+        raise RuntimeError("NumPy is required for ZWO-assisted capture. Install it with: pip install numpy") from e
+
+def _load_zwoasi(lib_path=None):
+    try:
+        import zwoasi as asi
+    except Exception as e:
+        raise RuntimeError(
+            "Python package 'zwoasi' is not installed. Install it and set ZWO_ASI_LIB to your ASICamera2 SDK library."
+        ) from e
+
+    if not getattr(_load_zwoasi, "_initialized", False):
+        sdk_path = lib_path or os.getenv("ZWO_ASI_LIB")
+        try:
+            if sdk_path:
+                asi.init(sdk_path)
+            else:
+                asi.init()
+        except TypeError:
+            if not sdk_path:
+                raise RuntimeError("Set ZWO_ASI_LIB to the ASICamera2 SDK library path before using the ZWO routine.")
+            asi.init(sdk_path)
+        except Exception as e:
+            if sdk_path:
+                raise RuntimeError(f"Could not initialize ASICamera2 SDK from '{sdk_path}': {e}") from e
+            raise RuntimeError("Could not initialize the ZWO ASI SDK. Set ZWO_ASI_LIB to the ASICamera2 SDK library path.") from e
+        _load_zwoasi._initialized = True
+
+    return asi
+
+def _zwo_open_camera(camera_index=0, exposure_ms=10.0, gain=0, lib_path=None):
+    asi = _load_zwoasi(lib_path=lib_path)
+    num_cameras = asi.get_num_cameras()
+    if num_cameras < 1:
+        raise RuntimeError("No ZWO cameras detected.")
+    if camera_index < 0 or camera_index >= num_cameras:
+        raise RuntimeError(f"Camera index {camera_index} is out of range (found {num_cameras}).")
+
+    camera = asi.Camera(camera_index)
+    try:
+        camera.stop_video_capture()
+    except Exception:
+        pass
+    try:
+        camera.stop_exposure()
+    except Exception:
+        pass
+
+    try:
+        camera.set_image_type(asi.ASI_IMG_RAW8)
+    except Exception:
+        pass
+    try:
+        camera.set_control_value(asi.ASI_EXPOSURE, int(round(exposure_ms * 1000.0)))
+    except Exception:
+        pass
+    try:
+        camera.set_control_value(asi.ASI_GAIN, int(gain))
+    except Exception:
+        pass
+
+    return asi, camera
+
+def _zwo_frame_to_array(frame, camera, np):
+    if hasattr(frame, "shape"):
+        return frame
+    if isinstance(frame, memoryview):
+        frame = frame.tobytes()
+    if isinstance(frame, (bytes, bytearray)):
+        width, height, _, _ = camera.get_roi_format()
+        arr = np.frombuffer(frame, dtype=np.uint8)
+        expected = int(width) * int(height)
+        if arr.size < expected:
+            raise RuntimeError(f"Captured frame is too small ({arr.size} bytes, expected {expected}).")
+        return arr[:expected].reshape((int(height), int(width)))
+    raise RuntimeError(f"Unsupported frame type from ZWO camera: {type(frame)!r}")
+
+def _zwo_capture_metric(camera, roi=None, average_frames=3):
+    np = _load_numpy()
+    metrics = []
+    for _ in range(max(1, int(average_frames))):
+        frame = None
+        if hasattr(camera, "capture_video_frame"):
+            try:
+                frame = camera.capture_video_frame()
+            except Exception:
+                frame = None
+        if frame is None and hasattr(camera, "capture"):
+            frame = camera.capture()
+        if frame is None:
+            raise RuntimeError("Could not capture a frame from the ZWO camera.")
+
+        arr = _zwo_frame_to_array(frame, camera, np)
+        if roi:
+            x, y, w, h = roi
+            if x >= arr.shape[1] or y >= arr.shape[0]:
+                raise RuntimeError(f"ROI {roi} is outside the camera frame {arr.shape[1]}x{arr.shape[0]}.")
+            arr = arr[y:min(y + h, arr.shape[0]), x:min(x + w, arr.shape[1])]
+        region = arr.astype(np.float32, copy=False)
+        background = float(np.percentile(region, 10.0))
+        metrics.append(float(np.clip(region - background, 0.0, None).sum()))
+    return sum(metrics) / len(metrics)
+
+def zwo_assisted_reference_capture():
+    try:
+        lam = float(_prompt_or_quit("Known line wavelength λ (nm) (q=quit): "))
+        order_m = int(_prompt_or_quit("Diffraction order m (int, nonzero) (q=quit): "))
+        if order_m == 0:
+            raise ValueError("order m must be nonzero")
+
+        premove = input("Pre-move to the current model prediction first? [y/N]: ").strip().lower() == "y"
+        mode = None
+        if premove:
+            mode = _ask_approach_mode()
+
+        half_width_steps = int(_prompt_or_quit("Scan half-width in steps (q=quit): "))
+        step_size_steps = int(_prompt_or_quit("Scan step size in steps (q=quit): "))
+        if half_width_steps <= 0 or step_size_steps <= 0:
+            raise ValueError("Scan width and step size must be positive integers.")
+        if step_size_steps > half_width_steps:
+            raise ValueError("Scan step size must be <= scan half-width.")
+
+        settle_raw = input("Settle time per point in seconds (ENTER=0.05): ").strip()
+        settle_s = float(settle_raw) if settle_raw else 0.05
+
+        avg_raw = input("Frames to average per point (ENTER=3): ").strip()
+        average_frames = int(avg_raw) if avg_raw else 3
+
+        camera_idx_raw = input("ZWO camera index (ENTER=0): ").strip()
+        camera_index = int(camera_idx_raw) if camera_idx_raw else 0
+
+        exposure_raw = input("Exposure in ms (ENTER=10): ").strip()
+        exposure_ms = float(exposure_raw) if exposure_raw else 10.0
+
+        gain_raw = input("Gain (ENTER=0): ").strip()
+        gain = int(gain_raw) if gain_raw else 0
+
+        lib_path_raw = input("ASICamera2 SDK library path (ENTER=use $ZWO_ASI_LIB): ").strip()
+        lib_path = lib_path_raw or None
+
+        roi_raw = input("ROI x,y,w,h (ENTER=full frame): ").strip()
+        roi = _parse_roi(roi_raw) if roi_raw else None
+    except _QuitToMain:
+        raise
+    except Exception as e:
+        print(f"[ZWO] Input error: {e}")
+        return
+
+    if premove:
+        print(f"[ZWO] Moving near λ={lam} nm, m={order_m} using the current wavelength model...")
+        move_to_wavelength_nonlinear(lam, order_m, mode=mode)
+
+    center_steps = int(step_count)
+    start_steps = center_steps - half_width_steps
+    total_points = (2 * half_width_steps) // step_size_steps + 1
+    sample_steps = []
+    sample_metrics = []
+    camera = None
+    _log_calibration_event(
+        f"ZWO scan start: lambda={lam} nm, order={order_m}, center_step={center_steps}, "
+        f"half_width={half_width_steps}, step_size={step_size_steps}, roi={roi}"
+    )
+
+    try:
+        _, camera = _zwo_open_camera(
+            camera_index=camera_index,
+            exposure_ms=exposure_ms,
+            gain=gain,
+            lib_path=lib_path,
+        )
+        if hasattr(camera, "start_video_capture"):
+            camera.start_video_capture()
+
+        print(
+            f"[ZWO] Scanning {total_points} points over ±{half_width_steps} steps "
+            f"around step {center_steps} for λ={lam} nm, m={order_m}."
+        )
+
+        _move_to_target_steps_fixed_approach(start_steps, final_dir=+1)
+
+        for i in range(total_points):
+            _check_cancel()
+            _sleep_with_cancel(settle_s)
+            metric = _zwo_capture_metric(camera, roi=roi, average_frames=average_frames)
+            sample_steps.append(int(step_count))
+            sample_metrics.append(metric)
+            print(
+                f"[ZWO] step={step_count:6d} θ={_steps_to_theta_deg(step_count):9.6f}° "
+                f"metric={metric:12.3f}"
+            )
+            if i != total_points - 1:
+                move_biased(step_size_steps, EDGE_STEP_DELAY, +1)
+
+    except _QuitToMain:
+        raise
+    except Exception as e:
+        print(f"[ZWO] Scan failed: {e}")
+        return
+    finally:
+        if camera is not None:
+            try:
+                camera.stop_video_capture()
+            except Exception:
+                pass
+            try:
+                camera.close()
+            except Exception:
+                pass
+
+    peak_step, peak_idx = _quadratic_peak_center(sample_steps, sample_metrics)
+    peak_theta = _steps_to_theta_deg(peak_step)
+    peak_metric = sample_metrics[peak_idx]
+    refs = list(_wl_load(STATE_DIR).get("refs", []))
+    model = _wl_load(STATE_DIR).get("model")
+    refs.append({"theta_deg": float(peak_theta), "lambda_nm": float(lam), "order_m": int(order_m)})
+    _wl_save(STATE_DIR, refs, model)
+
+    print(
+        f"[ZWO] Added ref from peak fit: θ={peak_theta:.6f}°, λ={lam} nm, m={order_m} "
+        f"(peak metric≈{peak_metric:.3f})."
+    )
+    _log_calibration_event(
+        f"ZWO ref added: theta={peak_theta:.6f} deg, lambda={lam} nm, order={order_m}, peak_metric={peak_metric:.3f}"
+    )
+    if 0 < peak_idx < len(sample_steps) - 1:
+        print(f"[ZWO] Quadratic peak center at step {peak_step:.3f} between sampled points.")
+    else:
+        print("[ZWO] Peak landed on a scan edge; widen the scan window if you want a cleaner fit.")
+
+    move_to_peak = input("Move to the fitted peak center now? [Y/n]: ").strip().lower()
+    if move_to_peak not in ("n", "no"):
+        _move_to_target_steps_fixed_approach(int(round(peak_step)), final_dir=+1)
+
+    fit_now = input(
+        "Immediate refit? [a]=affine, [o]=origin, [s]=sin(θ+θ0), [c]=sinθ+Bcosθ, ENTER=skip: "
+    ).strip().lower()
+    try:
+        if fit_now == "a":
+            a, b = _fit_littrow_linear(refs)
+            model = {"kind": "affine_littrow", "a": float(a), "b": float(b)}
+        elif fit_now == "o":
+            a, b = _fit_littrow_through_origin(refs)
+            model = {"kind": "affine_littrow", "a": float(a), "b": float(b)}
+        elif fit_now == "s":
+            sin_coeff, cos_coeff = _fit_sin_cos_model(refs)
+            amplitude_nm = math.hypot(sin_coeff, cos_coeff)
+            theta0_deg = math.degrees(math.atan2(cos_coeff, sin_coeff)) if amplitude_nm else 0.0
+            model = {
+                "kind": "sin_theta_offset",
+                "amplitude_nm": float(amplitude_nm),
+                "theta0_deg": float(theta0_deg),
+            }
+        elif fit_now == "c":
+            sin_coeff, cos_coeff = _fit_sin_cos_model(refs)
+            model = {
+                "kind": "sin_cos",
+                "sin_coeff_nm": float(sin_coeff),
+                "cos_coeff_nm": float(cos_coeff),
+            }
+        else:
+            model = None
+
+        if model is not None:
+            model = _normalize_wl_model(model)
+            _wl_save(STATE_DIR, refs, model)
+            res = _wl_model_residuals(refs, model)
+            rms = (sum(r*r for r in res) / len(res)) ** 0.5 if res else 0.0
+            mx = max(abs(r) for r in res) if res else 0.0
+            print(f"[ZWO] Model saved. {_wl_model_summary(model)}")
+            print(f"[ZWO] Residuals on λ/m: RMS={rms:.6f} nm, max={mx:.6f} nm")
+            _log_calibration_event(
+                f"ZWO refit saved: {_wl_model_summary(model)}; residual_rms={rms:.6f} nm, residual_max={mx:.6f} nm"
+            )
+    except Exception as e:
+        print(f"[ZWO] Fit failed: {e}")
+
+
+def _log_homing_event(message):
+    logging.info(f"[Home] {message}")
+
+def _log_calibration_event(message):
+    logging.info(f"[Cal] {message}")
+
+def _clear_sensor_terminal_line():
+    global _last_sensor_terminal_width, _last_sensor_terminal_time
+    if _last_sensor_terminal_width <= 0:
+        _last_sensor_terminal_time = 0.0
+        return
+    sys.stdout.write("\r" + (" " * _last_sensor_terminal_width) + "\r")
+    sys.stdout.flush()
+    _last_sensor_terminal_width = 0
+    _last_sensor_terminal_time = 0.0
+
+def _print_sensor_snapshot(message, *, inline=True):
+    global _last_sensor_terminal_width
+    if inline:
+        padded = message
+        if len(message) < _last_sensor_terminal_width:
+            padded = message + (" " * (_last_sensor_terminal_width - len(message)))
+        sys.stdout.write("\r" + padded)
+        sys.stdout.flush()
+        _last_sensor_terminal_width = len(padded)
+        return
+    _clear_sensor_terminal_line()
+    print(message)
+
+def _set_debug_mode(enabled):
+    global DEBUG_MOTION_LOGGING, DEBUG_TERMINAL_OUTPUT
+    DEBUG_MOTION_LOGGING = bool(enabled)
+    DEBUG_TERMINAL_OUTPUT = bool(enabled)
+
+def toggle_debug_mode():
+    _set_debug_mode(not DEBUG_MOTION_LOGGING)
+    state = "ON" if DEBUG_MOTION_LOGGING else "OFF"
+    print(f"[Debug] Continuous sensor debug is {state}.")
+    if DEBUG_MOTION_LOGGING:
+        print("[Debug] monitor_sensors() will stream every sample to the log and terminal.")
+    else:
+        print("[Debug] monitor_sensors() will log sensor changes only, except during jog mode.")
+
+def _sensor_state_label(value):
+    return (
+        "Waiting" if value is None else
+        "BLOCKED" if value else
+        "OPEN"
+    )
+
+def _direction_label(direction):
+    if direction > 0:
+        return "CW"
+    if direction < 0:
+        return "CCW"
+    return "IDLE"
+
+def _motor_direction(stage_direction):
+    return (1 if stage_direction > 0 else -1) * MOTOR_SEQUENCE_SIGN
+
+def _seq_index_from_step_count(step_value):
+    if not seq:
+        return 0
+    return (int(step_value) * MOTOR_SEQUENCE_SIGN) % len(seq)
+
+def _format_sensor_snapshot(state1, state2, *, reason=None, debug=False):
+    if reason == "jog":
+        theta_text = "--"
+        try:
+            theta_text = f"{_steps_to_theta_deg(step_count):+9.4f}deg"
+        except Exception:
+            pass
+        ref = "BOTH-OPEN" if (state1 == "OPEN" and state2 == "OPEN") else ("S2-OPEN" if state2 == "OPEN" else "--")
+        return (
+            f"JOG | dir={_direction_label(JOG_DISPLAY_DIR):<4} | spd={_delay_to_ms(step_delay):4d}ms | step={step_count:+8d} | "
+            f"theta={theta_text} | S1={state1:<7} | S2={state2:<7} | ref={ref}"
+        )
+    tag = "[Sensors:debug]" if debug else "[Sensors]"
+    msg = f"{tag} S1={state1} | S2={state2} | step={step_count}"
+    if reason:
+        msg += f" | {reason}"
+    return msg
+
+def _log_sensor_snapshot(state1, state2, *, reason=None, debug=False):
+    msg = _format_sensor_snapshot(state1, state2, reason=reason, debug=debug)
+    logging.info(msg)
+    return msg
+
+def monitor_sensors(debug=False, reason=None):
+    global step_count, rev_count, switch1, switch2, last_states, home, _last_sensor_terminal_time
+
     switch1 = board.digital[optical_pin].read()
     switch2 = board.digital[optical_pin2].read()
 
-    state1 = (
-        "Waiting" if switch1 is None else
-        "BLOCKED" if switch1 else
-        "OPEN"
-    )
-    state2 = (
-        "Waiting" if switch2 is None else
-        "BLOCKED" if switch2 else
-        "OPEN"
-    )
- 
-    #print(f"Sensor 1: {state1} | Sensor 2: {state2}")
-    logging.info(f"Sensor 1: {state1} | Sensor 2: {state2}")
+    state1 = _sensor_state_label(switch1)
+    state2 = _sensor_state_label(switch2)
+
+    changed = (state1 != last_states[0]) or (state2 != last_states[1])
+    log_every = debug or DEBUG_MOTION_LOGGING
+    print_every = debug or DEBUG_TERMINAL_OUTPUT or JOG_STREAM_SENSORS
+
+    if log_every:
+        _log_sensor_snapshot(state1, state2, reason=reason, debug=True)
+    elif changed:
+        _log_sensor_snapshot(state1, state2, reason=reason, debug=False)
+
+    if print_every:
+        now = time.time()
+        should_refresh = changed or (now - _last_sensor_terminal_time) >= JOG_TERMINAL_REFRESH_S
+        if should_refresh:
+            msg = _format_sensor_snapshot(state1, state2, reason=reason, debug=(debug or DEBUG_MOTION_LOGGING))
+            _print_sensor_snapshot(msg, inline=True)
+            _last_sensor_terminal_time = now
+    last_states = [state1, state2]
 
     if state2 == "OPEN":
         #print("Home position detected!.")
@@ -1368,20 +2153,27 @@ def go_home2():
         - Optional fast pre-roll TOWARD home using approach_dir
         - Center in approach_dir (fast first pass is OK)
     """
-    global step_count
+    global step_count, _seq_index, _last_move_dir, _rev_scale_err_accum
+    _log_homing_event(f"go_home2 start: step_count={step_count}")
 
-    # Choose approach based on your convention; keep this mapping consistent
+    # Keep the useful behavior you wanted: use the signed position estimate to pick
+    # which direction to pre-roll/approach from. Positive means CW of home, so move
+    # CCW toward home; negative means CCW of home, so move CW toward home.
     if step_count > 0:
-        approach_dir = -1   # e.g., if +step_count means you're CW of home, approach CCW
+        approach_dir = -1
     elif step_count < 0:
         approach_dir = +1
     else:
-        approach_dir = +1   # default when exactly at home
+        approach_dir = HOME_DEFAULT_APPROACH_DIR
 
     s2_is_open = not _read_blocked(optical_pin2)
     bump_dir = -approach_dir  # leave the OPEN window opposite to the approach
 
     print(f"[go_home2] step_count={step_count}, s2_open={s2_is_open}, approach_dir={approach_dir}, bump_dir={bump_dir}")
+    _log_homing_event(
+        f"go_home2 state: step_count={step_count}, s2_open={s2_is_open}, "
+        f"approach_dir={approach_dir}, bump_dir={bump_dir}"
+    )
 
     try:
         if s2_is_open:
@@ -1392,24 +2184,28 @@ def go_home2():
             # Now do a single centering pass in the *approach_dir* (slow)
             open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=False)
             print(f"[Rehome@Open] S2 centered. OPEN≈{open_w} steps (dir {approach_dir}).")
+            _log_homing_event(f"S2 centered from open window: width≈{open_w} steps, dir={approach_dir}")
 
         else:
-            # --- NOT IN OPEN: optional fast pre-roll TOWARD home in the SAME sign as approach_dir ---
+            # Keep the sign-based pre-roll, but only as a helper. Home is still validated
+            # exclusively by the sensors before zeroing step_count.
             steps_far = abs(step_count)
             if steps_far > FAR_STEP_THRESHOLD:
                 fast_steps = steps_far - FAR_STEP_THRESHOLD
-                move_biased(fast_steps, FAST_STEP_DELAY, approach_dir)  # <— use approach_dir here, not a separate fast_chunk_dir
+                move_biased(fast_steps, FAST_STEP_DELAY, approach_dir)
 
-            # Center in approach_dir (fast first pass OK)
-            open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=True)
+            open_w = _center_on_open_window(optical_pin2, approach_dir, first_fast=False)
             print(f"[Rehome] S2 centered. OPEN≈{open_w} steps (dir {approach_dir}).")
+            _log_homing_event(f"S2 centered after approach: width≈{open_w} steps, dir={approach_dir}")
 
     except RuntimeError as e:
         # One safe retry in the opposite direction
         alt_dir = -approach_dir
         print(f"[Rehome] Centering failed in dir {approach_dir}: {e}. Retrying in dir {alt_dir}.")
+        _log_homing_event(f"Centering failed in dir {approach_dir}: {e}. Retrying in dir {alt_dir}")
         open_w = _center_on_open_window(optical_pin2, alt_dir, first_fast=False)
         print(f"[Rehome] Retry succeeded. OPEN≈{open_w} steps (dir {alt_dir}).")
+        _log_homing_event(f"Retry succeeded: width≈{open_w} steps, dir={alt_dir}")
         approach_dir = alt_dir  # downstream offset/tweak should follow the dir actually used
 
     # Apply per-direction offset from S2 center to true Disk Home
@@ -1420,13 +2216,20 @@ def go_home2():
     # Final bounded tweak so both sensors are OPEN
     if _micro_tweak_around_center(approach_dir):
         print("Arrived at Disk Home (both sensors OPEN).")
+        _log_homing_event("Arrived at Disk Home with both sensors OPEN")
     else:
         print("At reference, but both sensors not OPEN. Adjust TWEAK_RANGE or HOME_OFFSET_DIR.")
+        _log_homing_event("At reference but both sensors were not OPEN after micro-tweak")
+        return False
 
     _zero_s1_counters()  # (doesn't touch step_count)
-    # If you want step_count to represent “steps from Disk Home”, keep this:
     step_count = 0
+    _seq_index = 0
+    _last_move_dir = None
+    _rev_scale_err_accum = 0.0
     _persist_step_count()
+    _log_homing_event("Disk Home established. step_count reset to 0 and persisted")
+    return True
 
 
 #helper functions for optical home offset to be added to the position menu's wavelength to step calculation
@@ -1445,77 +2248,146 @@ def go_optical_home():
     Go to Disk Home (repeatable, via sensors), then apply the saved optical-home offset.
     """
     global OPTICAL_HOME_OFFSET_STEPS
-    go_home2()  # zeros step_count at Disk Home
+    if not go_home2():
+        print("[OpticalHome] Could not establish Disk Home.")
+        return False
     if OPTICAL_HOME_OFFSET_STEPS != 0:
         _stage_move_signed(OPTICAL_HOME_OFFSET_STEPS)
     print(f"[OpticalHome] At optical home (offset {OPTICAL_HOME_OFFSET_STEPS} steps from disk home).")
+    return True
 
 def find_optical_home_offset():
     global OPTICAL_HOME_OFFSET_STEPS  # ok at function scope
 
     # 1) Start from a clean Disk Home
-    go_home2()
+    if not go_home2():
+        print("[Offset] Could not establish Disk Home; offset adjust cancelled.")
+        return
 
+    drain_stdin()
     session_offset = 0
     running = True
+    coarse_nudge = _legacy_steps(10)
+    pending = deque()
+    pressed = set()
+    status_msg = "[Offset] Ready."
+    last_render = 0.0
+    status_dirty = True
 
     print("\n--- Set Optical Home Offset ---")
-    print("Use ↑/↓ to nudge (PgUp/PgDn = ±10). Press Enter or 's' to save, 'r' to reset, 'q'/Esc to cancel.")
-    time.sleep(5)
+    print(f"Use ↑/↓ to nudge by 1 half-step (PgUp/PgDn = ±{coarse_nudge}). Press Enter or 's' to save, 'r' to reset, 'q'/Esc to cancel.")
+    time.sleep(0.5)
 
     def _nudge(n):
-        nonlocal session_offset
+        nonlocal session_offset, status_msg, status_dirty
         if n == 0:
             return
         direction = 1 if n > 0 else -1
-        move_biased(abs(n), TWEAK_STEP_DELAY, direction)
+        move_exact(abs(n), TWEAK_STEP_DELAY, direction)
         session_offset += n
-        print(f"[Offset] session = {session_offset} steps (saved = {OPTICAL_HOME_OFFSET_STEPS})")
+        status_msg = (
+            f"OFFSET | dir={_direction_label(direction):<4} | session={session_offset:+7d} | "
+            f"saved={OPTICAL_HOME_OFFSET_STEPS:+7d} | step_count={step_count:+8d} | "
+            "Enter/s=save r=reset q=cancel"
+        )
+        status_dirty = True
+
+    def _key_id(key):
+        if hasattr(key, "char") and key.char:
+            return key.char.lower()
+        return key
+
+    def _queue_once(key, action):
+        nonlocal status_msg, status_dirty
+        kid = _key_id(key)
+        if kid in pressed:
+            return
+        pressed.add(kid)
+        if action[0] == "nudge" and len(pending) >= OFFSET_ADJUST_MAX_PENDING:
+            status_msg = "[Offset] Input throttled. Release keys and step again."
+            status_dirty = True
+            return
+        pending.append(action)
 
     def on_press(key):
-        nonlocal running, session_offset
-        global OPTICAL_HOME_OFFSET_STEPS     # ← IMPORTANT: write to the real global
+        nonlocal running
         try:
             if key == pynput_keyboard.Key.up:
-                _nudge(+1)
+                _queue_once(key, ("nudge", +1))
             elif key == pynput_keyboard.Key.down:
-                _nudge(-1)
+                _queue_once(key, ("nudge", -1))
             elif key == pynput_keyboard.Key.page_up:
-                _nudge(+10)
+                _queue_once(key, ("nudge", +coarse_nudge))
             elif key == pynput_keyboard.Key.page_down:
-                _nudge(-10)
+                _queue_once(key, ("nudge", -coarse_nudge))
             elif key == pynput_keyboard.Key.enter or (hasattr(key, "char") and key.char and key.char.lower() == 's'):
-                # Save & exit
-                OPTICAL_HOME_OFFSET_STEPS = session_offset
-                _persist_optical_offset()
-                # quick sanity check/readback
-                try:
-                    with open(OPTICAL_OFFSET_FILE, "r") as f:
-                        print(f"[Saved] Optical-home offset set to {OPTICAL_HOME_OFFSET_STEPS} steps "
-                              f"(file now has {f.read().strip()}).")
-                except Exception as e:
-                    print(f"[Saved] Offset persisted, but readback failed: {e}")
-                running = False
-                return False
+                _queue_once(key, ("save", None))
             elif key == pynput_keyboard.Key.esc or (hasattr(key, "char") and key.char and key.char.lower() == 'q'):
-                print("[Cancel] Leaving offset unchanged.")
-                running = False
-                return False
+                _queue_once(key, ("cancel", None))
             elif hasattr(key, "char") and key.char and key.char.lower() == 'r':
-                if session_offset != 0:
-                    _nudge(-session_offset)
-                    print("[Reset] Session offset reset to 0 (Disk Home).")
+                _queue_once(key, ("reset", None))
         except Exception as e:
             print(f"[Listener] {e}")
 
-    listener = pynput_keyboard.Listener(on_press=on_press)
+    def on_release(key):
+        try:
+            pressed.discard(_key_id(key))
+        except Exception:
+            pass
+
+    listener = _make_keyboard_listener(on_press=on_press, on_release=on_release)
     listener.start()
     try:
         while running:
-            monitor_sensors()
-            time.sleep(0.05)
+            action_executed = False
+            if pending:
+                action, value = pending.popleft()
+                if action == "nudge":
+                    _nudge(value)
+                    action_executed = True
+                elif action == "reset":
+                    if session_offset != 0:
+                        _nudge(-session_offset)
+                    status_msg = (
+                        f"OFFSET | dir=IDLE | session={session_offset:+7d} | "
+                        f"saved={OPTICAL_HOME_OFFSET_STEPS:+7d} | step_count={step_count:+8d} | "
+                        "Reset to Disk Home"
+                    )
+                    status_dirty = True
+                    action_executed = True
+                elif action == "save":
+                    OPTICAL_HOME_OFFSET_STEPS = session_offset
+                    _persist_optical_offset()
+                    _maybe_persist_step_count(force=True)
+                    try:
+                        with open(OPTICAL_OFFSET_FILE, "r") as f:
+                            status_msg = (
+                                f"[Saved] Optical-home offset set to {OPTICAL_HOME_OFFSET_STEPS} steps "
+                                f"(file now has {f.read().strip()})."
+                            )
+                    except Exception as e:
+                        status_msg = f"[Saved] Offset persisted, but readback failed: {e}"
+                    running = False
+                    break
+                elif action == "cancel":
+                    status_msg = "[Cancel] Leaving offset unchanged."
+                    _maybe_persist_step_count(force=True)
+                    running = False
+                    break
+
+            monitor_sensors(reason="offset_adjust")
+            now = time.time()
+            if action_executed or status_dirty or (now - last_render) >= OFFSET_ADJUST_REFRESH_S:
+                _print_sensor_snapshot(status_msg, inline=True)
+                last_render = now
+                status_dirty = False
+            time.sleep(0.01)
     finally:
         listener.stop()
+        listener.join(timeout=0.2)
+        settle_terminal_input()
+        _clear_sensor_terminal_line()
+        print(status_msg)
     print("Done setting optical-home offset.")
 
 
@@ -1524,6 +2396,10 @@ def go_home():
     global step_count, rev_count, steps_till_rev, steps_since_rev, transition_sequence, step_delay
     global home_revs, home_steps, home_pre_rev_steps, home_delta_steps
     print("\nMoving to Home Position...")
+    _log_homing_event(
+        f"go_home start: rev_count={rev_count}, step_count={step_count}, "
+        f"home_revs={home_revs}, home_steps={home_steps}"
+    )
 
     # Calculate total steps needed to get back to home
     # Determine direction: -1 = reverse, 1 = forward
@@ -1536,9 +2412,9 @@ def go_home():
     #print(f"Current revs: {rev_count}, home revs: {home_revs}")
     #print(f"Current steps: {step_count}, home steps: {home_steps}")
     #print(f"Revolution difference: {rev_diff}, Step difference: {step_diff}")
-    logging.info(f"Current revs: {rev_count}, home revs: {home_revs}")
-    logging.info(f"Current steps: {step_count}, home steps: {home_steps}")
-    logging.info(f"Revolution difference: {rev_diff}, Step difference: {step_diff}")
+    _log_homing_event(f"Current revs: {rev_count}, home revs: {home_revs}")
+    _log_homing_event(f"Current steps: {step_count}, home steps: {home_steps}")
+    _log_homing_event(f"Revolution difference: {rev_diff}, Step difference: {step_diff}")
     # Calculate steps to move before reaching home
 
     direction = -1 if rev_diff > 0 or (rev_diff == 0 and step_diff > 0) else 1
@@ -1549,14 +2425,14 @@ def go_home():
 
     homing_steps = homing_steps+ steps_since_rev
     #print(f"Moving {abs(steps_since_rev)} steps in direction {direction}...")
-    logging.info(f"Moving {abs(steps_since_rev)} steps in direction {direction}...")
+    _log_homing_event(f"Moving {abs(steps_since_rev)} steps in direction {direction}")
 
     current_rev = rev_count
     
     # Move full revolutions first
     if rev_diff != 0:
         #print(f"Moving {abs(rev_diff)} full revs in direction {direction}...")
-        logging.info(f"Moving {abs(rev_diff)} full revs in direction {direction}...")
+        _log_homing_event(f"Moving {abs(rev_diff)} full revs in direction {direction}")
         while True:
             if rev_count != (current_rev + (rev_diff * direction)):
                 #move_stepper(seq, 1, step_delay, direction)
@@ -1565,13 +2441,13 @@ def go_home():
             else: 
                 break
     #print(f"Total revolutions moved: {abs(rev_diff)}")
-    logging.info(f"Total revolutions moved: {abs(rev_diff)}")
+    _log_homing_event(f"Total revolutions moved: {abs(rev_diff)}")
 
 
     #move the pre-revs steps + hysteresis 
     slower_delay = 0.005  # Adjust for slower speed of hysteresis
 
-    overshoot_steps = 20
+    overshoot_steps = _legacy_steps(20)
     #move_stepper(seq, steps_till_rev+overshoot_steps, slower_delay, direction)
     move_biased(steps = steps_till_rev+overshoot_steps, step_delay=slower_delay, direction=direction)
     homing_steps = homing_steps + steps_till_rev + overshoot_steps
@@ -1580,7 +2456,7 @@ def go_home():
     # Move back beyond home by 60 steps in opposite direction, slower
     opposite_direction = -1* direction
     
-    reverse_overshoot_steps = 10
+    reverse_overshoot_steps = _legacy_steps(10)
 
     print(f"Reversing direction by {overshoot_steps} steps (60 steps total) at slower speed.")
     #move_stepper(seq, overshoot_steps + reverse_overshoot_steps, slower_delay, opposite_direction)
@@ -1590,7 +2466,7 @@ def go_home():
     slowest_delay = slower_delay * 2
 
     #Slowly approach home position by moving forward 10 steps
-    fine_tune_steps = 10
+    fine_tune_steps = _legacy_steps(10)
     #print(f"Final forward adjustment of {fine_tune_steps} steps at slowest speed.")
     #move_stepper(seq, fine_tune_steps, slowest_delay, direction)
     move_biased(fine_tune_steps, step_delay=slowest_delay, direction=direction)
@@ -1621,12 +2497,12 @@ def go_home():
 
 
 def set_home():
-    global home_delta_steps, home_revs, home_steps, home_pre_rev_steps, step_count, rev_count, delta_steps, home
+    global home_delta_steps, home_revs, home_steps, home_pre_rev_steps, step_count, rev_count, delta_steps, home, _seq_index
     global steps_till_rev, last_switch1_state, last_switch2_state , transition_sequence, steps_since_rev
     print("Please use jog mode to set worm gear to home (switch 2 open) quit jog mode.")
     time.sleep(3)
     drain_stdin()
-    jog_mode2(step_delay=0.001)
+    jog_mode2()
     drain_stdin()
 
     init_steps = step_count
@@ -1644,6 +2520,7 @@ def set_home():
 
     # Explicitly reset counts when setting new home
     step_count = 0  # Reset step count when explicitly setting home
+    _seq_index = 0
     rev_count = 0   # Reset revolution count
     steps_since_rev = 0
     steps_till_rev = 0
@@ -1686,6 +2563,35 @@ def _frange_inclusive(a: float, b: float, step: float):
             x += step
     return vals
 
+def _move_scan_to_first_target(target_steps: int, *, mode: str, force_home: bool = False):
+    """
+    Position to the first point of a scan.
+    - `mode` only controls the very first acquisition of the scan start.
+    - `force_home` is used by rehome-per-repeat.
+    """
+    target_steps = int(round(target_steps))
+
+    if force_home or mode == "from_home_ccw":
+        if not go_home2():
+            raise RuntimeError("Could not establish Disk Home before scan start.")
+        _stage_move_signed(target_steps)
+        return
+
+    if mode == "shortest":
+        _move_to_target_steps_fixed_approach(target_steps)
+        return
+
+    raise ValueError("mode must be 'from_home_ccw' or 'shortest'")
+
+def _scan_step_to_target(target_steps: int):
+    """
+    Move directly from the current point to the next scan point without re-homing.
+    This preserves a true stepped scan between endpoints.
+    """
+    delta_steps = int(round(target_steps)) - int(round(step_count))
+    if delta_steps != 0:
+        _stage_move_signed(delta_steps)
+
 def scan_wavelength(
     lam1: float,
     lam2: float,
@@ -1707,39 +2613,46 @@ def scan_wavelength(
 
     repeats repeats the scan.
     pingpong alternates direction each repeat.
-    rehome_each_repeat will go to optical home before each repeat.
+    rehome_each_repeat will re-index at Disk Home before each repeat.
     dwell_s pauses at each point (useful for integrations).
     """
     if repeats < 1:
         raise ValueError("repeats must be >= 1")
+    if order_m == 0:
+        raise ValueError("order_m must be non-zero")
     if step_nm <= 0:
         raise ValueError("step_nm must be > 0")
+    if dwell_s < 0:
+        raise ValueError("dwell_s must be >= 0")
+    if margin_nm < 0:
+        raise ValueError("margin_nm must be >= 0")
 
     direction = 1 if lam2 > lam1 else -1
     start = lam1 - direction * margin_nm
     end   = lam2 + direction * margin_nm
 
     points_fwd = _frange_inclusive(start, end, step_nm)
+    target_steps_fwd = []
+    for lam in points_fwd:
+        theta = _theta_deg_from_lambda(lam, order_m)
+        target_steps_fwd.append(_target_steps_from_disk_home(theta))
 
     for r in range(repeats):
         _check_cancel()
+        reverse_repeat = pingpong and (r % 2 == 1)
+        points = list(reversed(points_fwd)) if reverse_repeat else points_fwd
+        target_steps = list(reversed(target_steps_fwd)) if reverse_repeat else target_steps_fwd
 
-        if rehome_each_repeat:
-            # Use optical home to reset mechanical state in a repeatable way
-            go_optical_home()
-
-        points = points_fwd
-        if pingpong and (r % 2 == 1):
-            points = list(reversed(points_fwd))
-
-        # Move to the first point explicitly before stepping through the list
-        move_to_wavelength_nonlinear(points[0], order_m, mode=mode)
+        force_home = rehome_each_repeat
+        if r == 0 or force_home:
+            _move_scan_to_first_target(target_steps[0], mode=mode, force_home=force_home)
+        else:
+            _scan_step_to_target(target_steps[0])
 
         for i, lam in enumerate(points):
             _check_cancel()
-            # Already at first point; for the rest, move to each target
             if i != 0:
-                move_to_wavelength_nonlinear(lam, order_m, mode=mode)
+                _scan_step_to_target(target_steps[i])
 
             # Optional dwell for acquisition
             _sleep_with_cancel(dwell_s)
@@ -1764,29 +2677,34 @@ def scan_angle(
         raise ValueError("repeats must be >= 1")
     if step_deg <= 0:
         raise ValueError("step_deg must be > 0")
+    if dwell_s < 0:
+        raise ValueError("dwell_s must be >= 0")
+    if margin_deg < 0:
+        raise ValueError("margin_deg must be >= 0")
 
     direction = 1 if theta2_deg > theta1_deg else -1
     start = theta1_deg - direction * margin_deg
     end   = theta2_deg + direction * margin_deg
 
     points_fwd = _frange_inclusive(start, end, step_deg)
+    target_steps_fwd = [_target_steps_from_disk_home(theta) for theta in points_fwd]
 
     for r in range(repeats):
         _check_cancel()
+        reverse_repeat = pingpong and (r % 2 == 1)
+        points = list(reversed(points_fwd)) if reverse_repeat else points_fwd
+        target_steps = list(reversed(target_steps_fwd)) if reverse_repeat else target_steps_fwd
 
-        if rehome_each_repeat:
-            go_optical_home()
-
-        points = points_fwd
-        if pingpong and (r % 2 == 1):
-            points = list(reversed(points_fwd))
-
-        move_to_angle_deg(points[0], mode=mode)
+        force_home = rehome_each_repeat
+        if r == 0 or force_home:
+            _move_scan_to_first_target(target_steps[0], mode=mode, force_home=force_home)
+        else:
+            _scan_step_to_target(target_steps[0])
 
         for i, th in enumerate(points):
             _check_cancel()
             if i != 0:
-                move_to_angle_deg(th, mode=mode)
+                _scan_step_to_target(target_steps[i])
             _sleep_with_cancel(dwell_s)
 
 def scan_menu():
@@ -1812,7 +2730,7 @@ def scan_menu():
             ping_s = input("Ping-pong direction each repeat? [y/N]: ").strip().lower()
             pingpong = (ping_s == "y")
 
-            reh_s = input("Re-home to Optical Home at start of each repeat? [y/N]: ").strip().lower()
+            reh_s = input("Re-home at Disk Home at start of each repeat? [y/N]: ").strip().lower()
             rehome_each_repeat = (reh_s == "y")
 
             dwell_s_raw = input("Dwell at each point in seconds (ENTER=0): ").strip()
@@ -1823,7 +2741,8 @@ def scan_menu():
                 lam2 = float(_prompt_or_quit("End wavelength   λ2 (nm) (q=quit): "))
                 m = int(_prompt_or_quit("Diffraction order m (int) (q=quit): "))
 
-                step_nm = float(_prompt_or_quit("Step size (nm) (q=quit): "))
+                step_nm_raw = _prompt_or_quit("Step size (nm) (ENTER=1.0, q=quit): ")
+                step_nm = float(step_nm_raw) if step_nm_raw else 1.0
                 margin_nm_raw = input("Endpoint margin (nm) (ENTER=0): ").strip()
                 margin_nm = float(margin_nm_raw) if margin_nm_raw else 0.0
 
@@ -1842,7 +2761,8 @@ def scan_menu():
             elif ch == "2":
                 th1 = float(_prompt_or_quit("Start angle θ1 (deg) (q=quit): "))
                 th2 = float(_prompt_or_quit("End angle   θ2 (deg) (q=quit): "))
-                step_deg = float(_prompt_or_quit("Step size (deg) (q=quit): "))
+                step_deg_raw = _prompt_or_quit("Step size (deg) (ENTER=0.05, q=quit): ")
+                step_deg = float(step_deg_raw) if step_deg_raw else 0.05
                 margin_deg_raw = input("Endpoint margin (deg) (ENTER=0): ").strip()
                 margin_deg = float(margin_deg_raw) if margin_deg_raw else 0.0
 
@@ -1919,7 +2839,7 @@ def position_menu():
         print("3) Move to wavelength λ (nm) & order m")
         print("4) Show current S2 steps/deg and integrity check")
         print("5) Wavelength calibration (refs & fit)") 
-        print("J) Jog mode (hold UP/DOWN to move)")
+        print("J) Jog mode (UP/DOWN move, LEFT/RIGHT adjust speed)")
         print("H) Go Home")
         print("Q) Back to main menu")
 
@@ -1932,7 +2852,8 @@ def position_menu():
 
             steps = calibrate_s2_steps_per_rev(approach_dir=approach_dir)
             # (S2 calibration is already persisted by calibrate_s2_steps_per_rev)
-            go_home2()
+            if not go_home2():
+                print("[Pos] S2 calibration finished, but re-home failed afterward.")
 
         elif choice == "2":
             try:
@@ -1984,7 +2905,7 @@ def position_menu():
 
         elif choice in ("j", "J"):
             drain_stdin()
-            jog_mode2(step_delay)   
+            jog_mode2()
             drain_stdin()
             # returns here when you quit Jog mode
 
@@ -2076,34 +2997,54 @@ def _ask_approach_mode():
 
 def goto_menu():
     """
-    Repeatedly prompt for a signed step move.
-    +N => CW, -N => CCW (matches internal convention: direction=+1 is CW).
+    Repeatedly prompt for either a relative or absolute step move.
+    +N/-N => relative CW/CCW move.
+    =N    => absolute step target from Disk Home.
     Type 'j' to jump to Jog, 'q' to quit back to main.
     """
     global step_delay  # for jog_mode2
 
-    print("\n--- GoTo (relative steps) ---")
-    print("Enter an integer step count:")
-    print("  +N = CW (forward)")
-    print("  -N = CCW (reverse)")
+    print("\n--- GoTo (steps) ---")
+    print(f"Current step_count = {step_count}")
+    print("Enter either:")
+    print("  +N = relative CW move")
+    print("  -N = relative CCW move")
+    print("  =N = absolute target step position")
     print("  j  = jump to Jog")
     print("  q  = quit to main menu")
 
     while True:
-        s = input("GoTo steps (+CW / -CCW, j, q): ").strip().lower()
+        s = input("GoTo command (+/-N relative, =N absolute, j, q): ").strip().lower()
         if s == "q":
             print("Leaving GoTo.")
             return
         if s == "j":
             drain_stdin()
-            jog_mode2(step_delay)   # returns here when you quit Jog
+            jog_mode2()   # returns here when you quit Jog
             drain_stdin()
+            continue
+        if s.startswith("="):
+            try:
+                target_steps = int(s[1:].strip())
+            except ValueError:
+                print("Absolute targets must look like =500 or =-1200.")
+                continue
+            delta_steps = target_steps - step_count
+            if delta_steps == 0:
+                print(f"Already at absolute step {target_steps}.")
+                continue
+            print(
+                f"[GoTo] Absolute target: {target_steps} steps "
+                f"(delta {delta_steps:+d}, {'CW' if delta_steps > 0 else 'CCW'})"
+            )
+            _stage_move_signed(delta_steps)
+            print(f"Done. Current step_count = {step_count}")
             continue
 
         try:
             user_steps = int(s)
         except ValueError:
-            print("Please enter an integer (e.g., 120 or -350), or j, or q.")
+            print("Please enter +N/-N, =N, j, or q.")
             continue
 
         if user_steps == 0:
@@ -2149,26 +3090,40 @@ def setup_logging():
     )
     fh.setFormatter(fmt)
 
-    ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
-
     logger.addHandler(fh)
-    logger.addHandler(ch)
+    if LOG_TO_CONSOLE:
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
-    logging.info(f"Logging to {LOG_FILE}")
+    print(f"[Log] Logging to {LOG_FILE}")
     return LOG_FILE
 
 def _persist_step_count():
     """Atomically write current step_count to STEP_FILE."""
+    global _last_persist_step, _last_persist_time
     os.makedirs(STATE_DIR, exist_ok=True)
     tmp = STEP_FILE + ".tmp"
     with open(tmp, "w") as f:
         f.write(str(step_count))
     os.replace(tmp, STEP_FILE)  # atomic on POSIX/macOS/Windows NTFS
+    _last_persist_step = int(step_count)
+    _last_persist_time = time.time()
+
+def _maybe_persist_step_count(force=False):
+    now = time.time()
+    if force:
+        _persist_step_count()
+        return
+    if abs(step_count - _last_persist_step) >= PERSIST_EVERY_STEPS:
+        _persist_step_count()
+        return
+    if (now - _last_persist_time) >= PERSIST_EVERY_SECONDS:
+        _persist_step_count()
 
 def _load_persisted_step_count():
     """Initialize step_count from STEP_FILE if present."""
-    global step_count
+    global step_count, _last_persist_step, _last_persist_time, _seq_index
     try:
         with open(STEP_FILE, "r") as f:
             txt = f.read().strip()
@@ -2180,6 +3135,9 @@ def _load_persisted_step_count():
     except Exception as e:
         print(f"[Persist] Could not read {STEP_FILE} ({e}); starting at 0")
         step_count = 0
+    _seq_index = _seq_index_from_step_count(step_count)
+    _last_persist_step = int(step_count)
+    _last_persist_time = time.time()
 
 def _persist_optical_offset():
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -2216,6 +3174,9 @@ def main():
     # Restore last position (if any)
     _load_persisted_step_count()
 
+    # Restore jog speed used by all jog entry points
+    _load_persisted_jog_speed()
+
     # NEW: restore optical-home offset
     _load_optical_offset()
 
@@ -2223,6 +3184,7 @@ def main():
     # >>> LOAD CALIBRATION <<<
     cal = load_cal(STATE_DIR) or {}          # <-- ensure dict
     apply_cal_to_globals(cal, globals())
+    _upgrade_legacy_calibration_units()
 
     # keep a dict-based store in _cal for WL refs/model, etc.
     global _cal
@@ -2234,18 +3196,24 @@ def main():
     if globals().get("STEPS_PER_DEG") in (None, 0):
         # You already have _s2_steps_fallback() defined
         S2_STEPS_PER_REV = _s2_steps_fallback()
-        STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0 # this should be near 50 steps/deg
+        STEPS_PER_DEG = S2_STEPS_PER_REV / 360.0 # half-step controller will be much larger than the legacy ~50 steps/deg
         print(f"[Cal] Using fallback S2_STEPS_PER_REV={S2_STEPS_PER_REV} → STEPS_PER_DEG={STEPS_PER_DEG:.6f}")
     else:
         print(f"[Cal] Loaded: S2_STEPS_PER_REV={S2_STEPS_PER_REV}, STEPS_PER_DEG={STEPS_PER_DEG:.6f}, "
               f"BACKLASH={BACKLASH_STEPS}, REVERSE_SCALE={DIR_REVERSE_SCALE}")
 
+    if steps_per_rev is not None and steps_per_rev < 200:
+        print("[Warn] This controller now counts one electrical half-step per software step.")
+        print("[Warn] Existing S1/S2 calibration appears to be from the old full-sequence counting scheme.")
+        print("[Warn] Re-run S1, S2, backlash, and optical-home calibration before trusting positions.")
 
-    logging.info("Starting stepper motor control")
+
+    print("[Log] Starting stepper motor control")
 
     print("Stepper Motor Control")
     print("G: GoTo Step. +N Forward CW, -N Reverse CCW")
-    print("J: Jog Mode (UP/DOWN arrows)")
+    print("J: Jog Mode (UP/DOWN move, LEFT/RIGHT adjust speed)")
+    print("D: Toggle Debug Mode")
     print("V: Speed Settings")
     print("H: Home Menu")
     print("C: Calibration")
@@ -2254,12 +3222,15 @@ def main():
     print("Q: Quit")
 
     while True:
-        cmd = prompt_cmd("Enter option GoTo, Jog, Speed Settings, Home, Calibration, Position Menu, Scan, Quit (G/J/V/H/C/P/S/Q): ")
+        cmd = prompt_cmd("Enter option GoTo, Jog, Debug, Speed Settings, Home, Calibration, Position Menu, Scan, Quit (G/J/D/V/H/C/P/S/Q): ")
         if cmd in ('G','g'):
            goto_menu()
            drain_stdin()
         elif cmd in ('J', 'j'):
-            jog_mode2(step_delay)
+            jog_mode2()
+            drain_stdin()
+        elif cmd in ('D', 'd'):
+            toggle_debug_mode()
             drain_stdin()
         elif cmd in ('V', 'v'):
             step_delay = set_speed(step_delay)
@@ -2286,11 +3257,12 @@ def main():
             drain_stdin()
 
         elif cmd in ('q', 'Q'):
+            _clear_sensor_terminal_line()
             print("Quitting.")
-            drain_stdin()
+            settle_terminal_input()
             break
         else:
-            print("Invalid option. Enter G, J, V, H, C, P, S, or Q.")
+            print("Invalid option. Enter G, J, D, V, H, C, P, S, or Q.")
             drain_stdin()
     for pin in pins:
         board.digital[pin].write(0)
