@@ -78,7 +78,7 @@ macOS ZWO camera install notes:
 brew install libusb
 ```
 
-If the ZWO SDK is not auto-detected, set the SDK path in the GUI or export it before launching:
+If the ZWO SDK is not auto-detected, set the SDK path in the GUI's Camera Pane or export it before launching:
 ```bash
 export ZWO_ASI_LIB="/full/path/to/libASICamera2.dylib"
 ```
@@ -87,6 +87,8 @@ Apple Silicon example:
 ```bash
 export ZWO_ASI_LIB="$HOME/Downloads/ASI_Camera_SDK/ASI_linux_mac_SDK_V1.41/lib/mac_arm64/libASICamera2.dylib"
 ```
+<img width="878" height="1282" alt="image" src="https://github.com/user-attachments/assets/1e125cb2-dcfd-4075-99b8-1a8ac3a8954a" />
+
 
 ## Quick Start
 1. Upload StandardFirmata to the Arduino.
