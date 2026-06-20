@@ -2,6 +2,10 @@
 
 Python-based control and calibration tooling for a stepper-driven monochromator using an Arduino and optical switches. The main interface is `controller.py`, an interactive CLI that supports homing, calibration, and positioning by steps, angle, or wavelength (Littrow model with fitted references).
 
+<img width="2846" height="1780" alt="image" src="https://github.com/user-attachments/assets/8ba8ba2d-5124-4048-ab57-3d34771cc65e" />
+
+
+ 
 ## Features
 - Interactive menu for GoTo, Jog, Speed, Home, Calibration, and Position.
 - Optical switch feedback for the small disk (S1) and worm gear (S2).
@@ -27,6 +31,8 @@ Wiring and system documentation:
 - `Dual Switch wiring.png`
 
 The GUI addendum contains the newer desktop GUI installation notes, ZWO camera setup, common GUI errors, and a feature-by-feature guide for the control, calibration, scan, and camera panes.
+
+
 
 ## Software
 Python:
@@ -95,6 +101,14 @@ setx ARDUINO_PORT COM5
 4. Run the desktop GUI:
 ```bash
 python monochromator_gui.py
+```
+Refresh Ports -> Select Arduino Port -> Initalize Controller ->ptionally connect to ZWO Camera. 
+
+You can also autostart the gui via 
+```bash
+Launch Monochromator GUI.command   // Mac
+Launch Monochromator GUI.bat       // windows
+Launch Monochromator GUI.sh        // Linux
 ```
 5. Or run the original CLI controller:
 ```bash
