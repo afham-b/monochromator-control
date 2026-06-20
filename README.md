@@ -1,6 +1,6 @@
 # Monochromator Control
 
-Python-based control and calibration tooling for a stepper-driven monochromator using an Arduino and optical switches. The main interface is `controller.py`, an interactive CLI that supports homing, calibration, and positioning by steps, angle, or wavelength (Littrow model with fitted references).
+Python-based control and calibration tooling for a stepper-driven monochromator using an Arduino and optical switches. The main interface is a Pyside6 python gui alongside `controller.py`, an interactive CLI that supports homing, calibration, and positioning by steps, angle, or wavelength (Littrow model with fitted references).
 
 <img width="2846" height="1780" alt="image" src="https://github.com/user-attachments/assets/8ba8ba2d-5124-4048-ab57-3d34771cc65e" />
 
